@@ -1,0 +1,12 @@
+[
+  {
+    "_id": "INT2001",
+    "candidate_id": "C001",
+    "audio_ref": "sample_interview.mp3",
+    "transcript": "Full interview transcript will be populated in Phase 4.",
+    "emotion_timeline": [
+      { "t": "00:12", "emotion": "confident", "score": 0.81 },
+      { "t": "00:47", "emotion": "hesitant", "score": 0.62 }
+    ]
+  }
+]

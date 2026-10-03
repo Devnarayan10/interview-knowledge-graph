@@ -1,0 +1,4129 @@
+I opened the ZIP and checked every existing file against your master prompt. Before you paste anything, three things you need to know:
+
+1. **`synthetic_interview_dataset.csv` is not in the ZIP.** I only know its column names from your prompt, so `loader.py` is defensive. It handles lists written as JSON, `;`, `|` or `,`, and it prints a column report when it seeds. Put the CSV at `data/synthetic_interview_dataset.csv`.
+2. **I could not run Neo4j or MongoDB here.** I read the existing code and wrote this to match it, but I haven't executed it. After you seed, run `validate_system.py`; it fails loudly if anything is wrong.
+3. **The dataset has no company, candidate name, score, emotion or feedback columns.**
+   - Company nodes are created only if a `company` column exists. Otherwise there are none, and I did not invent any.
+   - Names, scores, emotions and feedback are derived deterministically from the row data (formulas below). Everything is marked synthetic.
+
+**Relationships I added beyond DA1**, each needed by a feature:
+- `HAS_SKILL` (Candidate to Skill)
+- `INTERVIEWED_FOR` (Candidate to Role)
+- `FOR_ROLE` (Question to Role)
+
+## Files to create or modify
+
+```
+backend/requirements.txt          MODIFY (drops torch/whisper/spacy, adds pytest)
+backend/Dockerfile                MODIFY
+backend/pytest.ini                NEW
+backend/seed_database.py          MODIFY
+backend/validate_system.py        NEW
+backend/app/config.py             MODIFY
+backend/app/main.py               MODIFY
+backend/app/database/mongodb.py   MODIFY
+backend/app/database/schema.py    NEW
+backend/app/utils/errors.py       NEW
+backend/app/utils/helpers.py      NEW
+backend/app/seed/loader.py        NEW
+backend/app/schemas/{candidate,question,interview,evaluation}.py   NEW
+backend/app/services/{shared,candidate_service,question_service,interview_service,
+   evaluation_service,analytics_service,graph_service,recommendation_service,
+   database_service,seed_service}.py                                NEW
+backend/app/routes/{candidates,questions,interviews,analytics,graph,dashboard,
+   evaluation,recommendations,database,seed,catalog}.py             NEW
+backend/tests/test_*.py           NEW
+database/mongodb/seed.js          MODIFY
+database/neo4j/queries.cypher     NEW
+database/mongodb/queries.js       NEW
+data/synthetic_interview_dataset.csv   (your file)
+docker-compose.yml, .env.example  MODIFY
+frontend/src/...                  NEW/MODIFY (listed below)
+README.md, docs/*.md              REWRITE/NEW
+```
+`package.json`, `vite.config.js`, `tailwind.config.js`, `index.html`, `main.jsx`, `neo4j.py` and `constraints.cypher` are unchanged and already fine.
+
+---
+
+# BACKEND
+
+FILE: backend/requirements.txt
+STATUS: MODIFY
+```text
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+python-multipart==0.0.9
+neo4j==5.25.0
+pymongo==4.8.0
+pydantic==2.9.1
+pydantic-settings==2.5.2
+python-dotenv==1.0.1
+httpx==0.27.2
+pytest==8.3.3
+```
+
+FILE: backend/Dockerfile
+STATUS: MODIFY
+```dockerfile
+FROM python:3.11-slim
+
+WORKDIR /app
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY . .
+
+EXPOSE 8000
+
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
+```
+
+FILE: backend/pytest.ini
+STATUS: NEW
+```ini
+[pytest]
+pythonpath = .
+testpaths = tests
+```
+
+FILE: backend/app/config.py
+STATUS: MODIFY
+```python
+"""Application configuration loaded from environment variables."""
+
+from functools import lru_cache
+from typing import List
+
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_file=".env", env_file_encoding="utf-8", case_sensitive=False, extra="ignore"
+    )
+
+    # Neo4j
+    neo4j_uri: str = "bolt://localhost:7687"
+    neo4j_user: str = "neo4j"
+    neo4j_password: str = "interview_graph_password"
+    neo4j_database: str = "neo4j"
+
+    # MongoDB
+    mongodb_uri: str = "mongodb://localhost:27017"
+    mongodb_database: str = "interview_db"
+
+    # API
+    backend_host: str = "0.0.0.0"
+    backend_port: int = 8000
+    api_prefix: str = "/api"
+    cors_origins: str = "http://localhost:3000,http://localhost:5173"
+
+    # Seeding
+    auto_seed: bool = True
+    dataset_path: str = ""  # optional explicit path to the CSV
+
+    # Optional AI settings (not required; evaluation is deterministic)
+    llm_provider: str = "mock"
+
+    @property
+    def cors_origins_list(self) -> List[str]:
+        return [o.strip() for o in self.cors_origins.split(",") if o.strip()]
+
+
+@lru_cache
+def get_settings() -> Settings:
+    return Settings()
+```
+
+FILE: backend/app/database/mongodb.py
+STATUS: MODIFY
+```python
+"""MongoDB document database connection and collection access."""
+
+import logging
+from typing import Optional
+
+from pymongo import MongoClient
+from pymongo.collection import Collection
+from pymongo.database import Database
+
+from app.config import get_settings
+
+logger = logging.getLogger(__name__)
+
+_client: Optional[MongoClient] = None
+
+
+def get_mongo_client() -> MongoClient:
+    global _client
+    if _client is None:
+        settings = get_settings()
+        _client = MongoClient(settings.mongodb_uri, serverSelectionTimeoutMS=5000)
+        logger.info("MongoDB client initialized: %s", settings.mongodb_uri)
+    return _client
+
+
+def get_mongo_database() -> Database:
+    return get_mongo_client()[get_settings().mongodb_database]
+
+
+def get_collection(name: str) -> Collection:
+    return get_mongo_database()[name]
+
+
+def verify_mongodb_connection() -> bool:
+    try:
+        get_mongo_client().admin.command("ping")
+        return True
+    except Exception as exc:
+        logger.error("MongoDB connection failed: %s", exc)
+        return False
+
+
+def close_mongo_client() -> None:
+    global _client
+    if _client is not None:
+        _client.close()
+        _client = None
+        logger.info("MongoDB client closed")
+```
+
+FILE: backend/app/database/schema.py
+STATUS: NEW
+```python
+"""Automatic Neo4j constraint/index and MongoDB index initialisation (idempotent)."""
+
+import logging
+
+from app.database.mongodb import get_collection
+from app.database.neo4j import run_cypher
+
+logger = logging.getLogger(__name__)
+
+# (constraint name, label, property) - names match database/neo4j/constraints.cypher
+NEO4J_CONSTRAINTS = [
+    ("candidate_id_unique", "Candidate", "candidate_id"),
+    ("question_id_unique", "Question", "question_id"),
+    ("skill_id_unique", "Skill", "skill_id"),
+    ("role_id_unique", "Role", "role_id"),
+    ("company_id_unique", "Company", "company_id"),
+    ("answer_id_unique", "Answer", "answer_id"),
+    ("emotion_id_unique", "Emotion", "emotion_id"),
+    ("feedback_id_unique", "Feedback", "feedback_id"),
+    ("tech_id_unique", "Technology", "tech_id"),
+    ("round_id_unique", "InterviewRound", "round_id"),
+]
+
+NEO4J_INDEXES = [
+    ("candidate_name_idx", "Candidate", "name"),
+    ("skill_name_idx", "Skill", "name"),
+    ("question_category_idx", "Question", "category"),
+    ("role_title_idx", "Role", "title"),
+    ("company_name_idx", "Company", "name"),
+    ("answer_candidate_idx", "Answer", "candidate_id"),
+    ("answer_round_idx", "Answer", "round_id"),
+]
+
+
+def init_neo4j_schema() -> int:
+    applied = 0
+    for name, label, prop in NEO4J_CONSTRAINTS:
+        try:
+            run_cypher(f"CREATE CONSTRAINT {name} IF NOT EXISTS FOR (n:{label}) REQUIRE n.{prop} IS UNIQUE")
+            applied += 1
+        except Exception as exc:
+            logger.warning("Constraint %s skipped: %s", name, exc)
+    for name, label, prop in NEO4J_INDEXES:
+        try:
+            run_cypher(f"CREATE INDEX {name} IF NOT EXISTS FOR (n:{label}) ON (n.{prop})")
+            applied += 1
+        except Exception as exc:
+            logger.warning("Index %s skipped: %s", name, exc)
+    return applied
+
+
+def init_mongo_indexes() -> list[str]:
+    created = []
+    spec = {
+        "raw_interviews": ["candidate_id", "round_id", "target_role", "started_at"],
+        "emotion_logs": ["candidate_id", "interview_id", "label", "timestamp", "confidence"],
+    }
+    for coll, fields in spec.items():
+        for field in fields:
+            created.append(f"{coll}.{get_collection(coll).create_index([(field, 1)])}")
+    return created
+```
+
+FILE: backend/app/utils/errors.py
+STATUS: NEW
+```python
+class NotFoundError(Exception):
+    """Requested entity does not exist."""
+
+
+class ConflictError(Exception):
+    """Entity already exists."""
+
+
+class BadRequestError(Exception):
+    """Invalid request."""
+```
+
+FILE: backend/app/utils/helpers.py
+STATUS: NEW
+```python
+"""Shared helpers: slugs, list parsing, deterministic hashing, skill categories."""
+
+import ast
+import hashlib
+import json
+import re
+import uuid
+from typing import Any, Optional
+
+TECH_VOCAB = {
+    "python", "java", "c++", "c", "c#", "javascript", "typescript", "sql", "mysql", "postgresql",
+    "mongodb", "neo4j", "redis", "docker", "kubernetes", "aws", "azure", "gcp", "git", "linux",
+    "fastapi", "flask", "django", "react", "node.js", "tensorflow", "pytorch", "scikit-learn",
+    "pandas", "numpy", "spark", "hadoop", "tableau", "power bi", "excel", "opencv", "spring boot",
+}
+
+_CATEGORY_RULES = [
+    ("Programming", {"python", "java", "c++", "c", "c#", "javascript", "typescript", "go", "rust", "kotlin", "r", "scala"}),
+    ("Databases", {"sql", "mysql", "postgresql", "mongodb", "neo4j", "redis", "nosql", "database", "dbms"}),
+    ("Cloud & DevOps", {"aws", "azure", "gcp", "docker", "kubernetes", "git", "linux", "devops", "terraform", "ci/cd"}),
+    ("ML & AI", {"machine learning", "deep learning", "nlp", "tensorflow", "pytorch", "scikit-learn", "opencv", "yolov8", "ai", "computer vision"}),
+    ("Data", {"pandas", "numpy", "tableau", "power bi", "excel", "statistics", "spark", "hadoop", "etl", "analytics", "data analysis"}),
+    ("Web & APIs", {"react", "node.js", "django", "flask", "fastapi", "html", "css", "rest", "api", "spring"}),
+]
+
+
+def slugify(text: Any) -> str:
+    return re.sub(r"[^a-z0-9+#]+", "-", str(text).lower()).strip("-")
+
+
+def new_id(prefix: str) -> str:
+    return f"{prefix}-{uuid.uuid4().hex[:8].upper()}"
+
+
+def stable_hash(*parts: Any) -> int:
+    return int(hashlib.md5("|".join(map(str, parts)).encode()).hexdigest(), 16)
+
+
+def clean(value: Any) -> str:
+    if value is None:
+        return ""
+    s = str(value).strip()
+    return "" if s.lower() in {"nan", "none", "null"} else s
+
+
+def dedupe(items: list[str]) -> list[str]:
+    seen, out = set(), []
+    for it in items:
+        key = it.lower()
+        if key not in seen:
+            seen.add(key)
+            out.append(it)
+    return out
+
+
+def split_list(value: Any) -> list[str]:
+    """Parse a list stored as JSON, a Python repr, or delimited text (| ; ,)."""
+    s = clean(value)
+    if not s:
+        return []
+    if s[0] in "[(":
+        parsed = None
+        try:
+            parsed = json.loads(s)
+        except Exception:
+            try:
+                parsed = ast.literal_eval(s)
+            except Exception:
+                parsed = None
+        if isinstance(parsed, (list, tuple)):
+            return dedupe([str(x).strip() for x in parsed if str(x).strip()])
+        s = s.strip("[]()")
+    parts = [s]
+    for sep in ("|", ";", ","):
+        if sep in s:
+            parts = s.split(sep)
+            break
+    return dedupe([p.strip().strip("'\"") for p in parts if p.strip().strip("'\"")])
+
+
+def parse_years(text: Any) -> Optional[float]:
+    m = re.search(r"(\d+(?:\.\d+)?)\s*\+?\s*(?:years?|yrs?)", clean(text), re.I)
+    return float(m.group(1)) if m else None
+
+
+def categorize_skill(name: str) -> str:
+    low = name.lower()
+    tokens = set(re.split(r"[^a-z0-9+#./]+", low))
+    for category, keys in _CATEGORY_RULES:
+        for k in keys:
+            if (" " in k and k in low) or (" " not in k and k in tokens):
+                return category
+    return "General"
+
+
+def skill_rows(names: list[str]) -> list[dict]:
+    return [{"id": "SK-" + slugify(n), "name": n, "category": categorize_skill(n)} for n in dedupe(names)]
+```
+
+FILE: backend/app/seed/loader.py
+STATUS: NEW
+```python
+"""CSV -> graph/document transformation. Pure Python: no database access.
+
+Derivations (documented because the CSV has no such columns):
+  * Candidate.name        = "Candidate <candidate_id>"
+  * experience_years      = number found in candidate_experience text ("3 years") else null
+  * Skill                 = union of the candidate `skills` column
+  * TESTS_SKILL           = skill names found in question text + keywords
+  * DEMONSTRATES          = skill names found in answer text + keywords
+  * Role                  = distinct target_role; department = most common candidate_domain
+  * REQUIRED_FOR (weight) = 2 * (#questions of the role testing the skill) + (#candidates interviewed
+                            for the role who hold the skill); top 10 per role
+  * Answer.score          = 10 * (0.55*keyword_coverage + 0.25*min(words/80,1) + 0.20*min(skills/2,1))
+  * Emotion / Feedback / dates = deterministic pseudo-random values seeded by ids (synthetic)
+"""
+
+import csv
+import random
+import re
+from collections import Counter, defaultdict
+from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Any
+
+from app.config import get_settings
+from app.utils.helpers import (
+    TECH_VOCAB, categorize_skill, clean, parse_years, slugify, split_list, stable_hash,
+)
+
+DATASET_NAME = "synthetic_interview_dataset.csv"
+EXPECTED_COLUMNS = [
+    "candidate_id", "candidate_domain", "education", "skills", "candidate_experience", "job_type",
+    "round_id", "question_id", "question", "question_category", "target_role", "difficulty",
+    "question_experience", "answer_id", "answer", "keywords",
+]
+PHASES = [("start", 0), ("middle", 60), ("end", 150)]
+
+
+def find_dataset() -> Path:
+    here = Path(__file__).resolve()
+    options = []
+    if get_settings().dataset_path:
+        options.append(Path(get_settings().dataset_path))
+    options += [
+        here.parents[2] / "data" / DATASET_NAME,
+        here.parents[3] / "data" / DATASET_NAME,
+        Path("/app/data") / DATASET_NAME,
+    ]
+    for p in options:
+        if p.exists():
+            return p
+    raise FileNotFoundError(
+        f"{DATASET_NAME} not found. Put it in <project>/data/ . Looked in: " + ", ".join(map(str, options))
+    )
+
+
+def read_rows(path: Path) -> list[dict[str, str]]:
+    with open(path, newline="", encoding="utf-8-sig") as f:
+        return [{(k or "").strip().lower(): (v or "").strip() for k, v in r.items()} for r in csv.DictReader(f)]
+
+
+def _pattern(name: str):
+    return re.compile(r"(?<![A-Za-z0-9+#])" + re.escape(name) + r"(?![A-Za-z0-9+#])", re.I)
+
+
+def score_answer(answer: str, keywords: list[str], n_skills: int = 0):
+    """Deterministic answer score. Returns (score, keyword_coverage, word_count, matched_keywords)."""
+    text = (answer or "").lower()
+    words = len(text.split())
+    hits = [k for k in keywords if k.lower() in text]
+    cov = len(hits) / len(keywords) if keywords else 0.5
+    score = 10 * (0.55 * cov + 0.25 * min(words / 80, 1.0) + 0.20 * min(n_skills / 2, 1.0))
+    return round(max(1.0, min(10.0, score)), 1), round(cov, 2), words, hits
+
+
+def _emotion(rng: random.Random, score: float) -> tuple[str, float]:
+    p = score / 10
+    weights = {
+        "confident": 0.5 * p + 0.05, "enthusiastic": 0.25 * p + 0.03, "neutral": 0.30,
+        "hesitant": 0.35 * (1 - p) + 0.05, "nervous": 0.40 * (1 - p) + 0.05,
+    }
+    label = rng.choices(list(weights), weights=list(weights.values()))[0]
+    return label, round(0.55 + 0.4 * rng.random(), 2)
+
+
+def transform(rows: list[dict[str, str]]) -> dict[str, Any]:
+    if not rows:
+        raise ValueError("Dataset is empty")
+    missing_cols = [c for c in EXPECTED_COLUMNS if c not in rows[0]]
+
+    vocab: dict[str, str] = {}
+    for r in rows:
+        for s in split_list(r.get("skills")):
+            vocab.setdefault(s.lower(), s)
+    skills = {k: {"skill_id": "SK-" + slugify(v), "name": v, "category": categorize_skill(v)} for k, v in vocab.items()}
+    patterns = {k: _pattern(v) for k, v in vocab.items()}
+
+    def find_skills(text: str) -> list[str]:
+        return [k for k, p in patterns.items() if p.search(text)]
+
+    candidates: dict[str, dict] = {}
+    cand_skill_keys: dict[str, list[str]] = {}
+    cand_rounds: dict[str, dict[str, int]] = defaultdict(dict)
+    questions: dict[str, dict] = {}
+    rounds: dict[str, dict] = {}
+    interviews: dict[str, dict] = {}
+    answers, emotion_logs = [], []
+    q_skills, a_skills, c_skills = set(), set(), set()
+    tested_by_role: dict[str, Counter] = defaultdict(Counter)
+    role_domains: dict[str, Counter] = defaultdict(Counter)
+    role_candidates: dict[str, set] = defaultdict(set)
+    cand_roles: set[tuple[str, str]] = set()
+    companies: dict[str, dict] = {}
+    cand_company: set[tuple[str, str]] = set()
+
+    for i, r in enumerate(rows):
+        cid = r.get("candidate_id") or r.get("candidate_source_id") or f"C{i + 1:03d}"
+        qid = r.get("question_id") or f"Q{i + 1:03d}"
+        aid = r.get("answer_id") or f"A{i + 1:03d}"
+        role = r.get("target_role") or r.get("source_role") or "General"
+        rraw = r.get("round_id") or "R1"
+        round_key = f"{cid}__{rraw}"
+        qtext, atext = r.get("question", ""), r.get("answer", "")
+        kws = split_list(r.get("keywords"))
+        diff = r.get("difficulty") or "Medium"
+        cat = r.get("question_category") or "General"
+
+        if cid not in candidates:
+            keys = [s.lower() for s in split_list(r.get("skills")) if s.lower() in skills]
+            cand_skill_keys[cid] = keys
+            candidates[cid] = {
+                "candidate_id": cid, "name": f"Candidate {cid}", "email": None,
+                "experience_years": parse_years(r.get("candidate_experience")),
+                "education": r.get("education") or None, "domain": r.get("candidate_domain") or None,
+                "job_type": r.get("job_type") or None, "skills": [skills[k]["name"] for k in keys],
+                "source_id": r.get("candidate_source_id") or None,
+                "experience_text": r.get("candidate_experience") or None,
+            }
+            for k in keys:
+                c_skills.add((cid, skills[k]["skill_id"]))
+
+        role_id = "R-" + slugify(role)
+        role_domains[role][r.get("candidate_domain") or "General"] += 1
+        role_candidates[role].add(cid)
+        cand_roles.add((cid, role_id))
+
+        tested = find_skills(qtext + " " + " ".join(kws))
+        shown = find_skills(atext + " " + " ".join(kws))
+
+        if qid not in questions:
+            questions[qid] = {
+                "question_id": qid, "text": qtext, "difficulty": diff, "category": cat,
+                "target_role": role, "role_id": role_id, "experience": r.get("question_experience") or None,
+                "keywords": kws,
+            }
+            for k in tested:
+                q_skills.add((qid, skills[k]["skill_id"]))
+                tested_by_role[role][k] += 1
+
+        if rraw not in cand_rounds[cid]:
+            cand_rounds[cid][rraw] = len(cand_rounds[cid]) + 1
+        rnum = cand_rounds[cid][rraw]
+        start = datetime(2025, 1, 6, 10, 0) + timedelta(days=stable_hash(round_key) % 180)
+        if round_key not in rounds:
+            rounds[round_key] = {
+                "round_id": round_key, "round_label": rraw, "round_number": rnum, "candidate_id": cid,
+                "date": start.date().isoformat(), "target_role": role,
+            }
+            interviews[round_key] = {
+                "_id": round_key, "interview_id": round_key, "candidate_id": cid, "round_id": round_key,
+                "round_label": rraw, "round_number": rnum, "target_role": role, "started_at": start,
+                "status": "completed", "transcript": [], "qa": [], "emotion_timeline": [],
+                "metadata": {k: v for k, v in {
+                    "synthetic": True, "dataset": DATASET_NAME, "candidate_domain": r.get("candidate_domain"),
+                    "job_type": r.get("job_type"), "source_role": r.get("source_role"),
+                    "source_type": r.get("source_type"), "answer_source": r.get("answer_source"),
+                    "merge_note": r.get("merge_note"),
+                }.items() if v not in (None, "")},
+            }
+        iv = interviews[round_key]
+
+        score, cov, words, hits = score_answer(atext, kws, len(shown))
+        rng = random.Random(stable_hash(aid))
+        t = 120 + len(iv["qa"]) * 240
+        samples = []
+        for phase, off in PHASES:
+            label, conf = _emotion(rng, score)
+            samples.append({"phase": phase, "timestamp_sec": t + off, "label": label, "confidence": conf})
+        dom = samples[1]
+        stamp = (start + timedelta(seconds=t)).isoformat()
+        missed = [k for k in kws if k not in hits]
+
+        answers.append({
+            "answer_id": aid, "candidate_id": cid, "question_id": qid, "round_id": round_key,
+            "transcript_text": atext, "score": score, "keyword_coverage": cov, "word_count": words,
+            "timestamp": stamp, "emotion_id": "EMO-" + aid, "emotion_label": dom["label"],
+            "emotion_confidence": dom["confidence"], "feedback_id": "FB-" + aid,
+            "strengths": ", ".join(hits[:4]) or "Relevant answer",
+            "weaknesses": ", ".join(missed[:4]) or "No major gaps detected",
+            "summary": f"Scored {score}/10 on a {diff} {cat} question (keyword coverage {cov:.0%}).",
+        })
+        for k in shown:
+            a_skills.add((aid, skills[k]["skill_id"]))
+
+        iv["transcript"] += [
+            {"speaker": "interviewer", "text": qtext, "t": t},
+            {"speaker": "candidate", "text": atext, "t": t + 30},
+        ]
+        iv["qa"].append({
+            "question_id": qid, "question": qtext, "category": cat, "difficulty": diff, "answer_id": aid,
+            "answer": atext, "score": score, "skills_tested": [skills[k]["name"] for k in tested],
+            "keywords": kws, "timestamp": stamp, "timestamp_sec": t,
+            "emotion": {"label": dom["label"], "confidence": dom["confidence"]},
+        })
+        for idx, s in enumerate(samples):
+            iv["emotion_timeline"].append({**s, "question_id": qid})
+            emotion_logs.append({
+                "_id": f"{aid}:{idx}", "interview_id": round_key, "candidate_id": cid, "question_id": qid,
+                "answer_id": aid, "label": s["label"], "confidence": s["confidence"], "phase": s["phase"],
+                "timestamp_sec": s["timestamp_sec"], "timestamp": start + timedelta(seconds=s["timestamp_sec"]),
+                "target_role": role, "synthetic": True,
+            })
+
+        company = r.get("company")
+        if company:
+            companies["CO-" + slugify(company)] = {
+                "company_id": "CO-" + slugify(company), "name": company, "industry": r.get("industry") or None,
+            }
+            cand_company.add((cid, "CO-" + slugify(company)))
+
+    # Roles + REQUIRED_FOR
+    roles, role_skills = {}, []
+    for role, doms in role_domains.items():
+        rid = "R-" + slugify(role)
+        roles[rid] = {"role_id": rid, "title": role, "department": doms.most_common(1)[0][0]}
+        holders = Counter(k for c in role_candidates[role] for k in cand_skill_keys[c])
+        weights = {k: tested_by_role[role][k] * 2 + holders[k] for k in set(tested_by_role[role]) | set(holders)}
+        for k, w in sorted(weights.items(), key=lambda kv: (-kv[1], kv[0]))[:10]:
+            if w > 0:
+                role_skills.append({"skill_id": skills[k]["skill_id"], "role_id": rid, "weight": w})
+
+    techs = {k: {"tech_id": "T-" + slugify(v["name"]), "name": v["name"]} for k, v in skills.items() if k in TECH_VOCAB}
+    skill_tech = [{"skill_id": skills[k]["skill_id"], "tech_id": t["tech_id"]} for k, t in techs.items()]
+
+    pair = lambda s, a, b: [{a: x, b: y} for x, y in sorted(s)]
+    data = {
+        "candidates": list(candidates.values()), "questions": list(questions.values()),
+        "skills": [{k: v for k, v in s.items()} for s in skills.values()], "roles": list(roles.values()),
+        "technologies": list(techs.values()), "companies": list(companies.values()),
+        "rounds": list(rounds.values()), "answers": answers,
+        "candidate_roles": [{"candidate_id": c, "role_id": r} for c, r in sorted(cand_roles)],
+        "candidate_skills": pair(c_skills, "candidate_id", "skill_id"),
+        "question_skills": pair(q_skills, "question_id", "skill_id"),
+        "answer_skills": pair(a_skills, "answer_id", "skill_id"),
+        "candidate_companies": pair(cand_company, "candidate_id", "company_id"),
+        "role_skills": role_skills, "skill_tech": skill_tech,
+        "mongo_interviews": list(interviews.values()), "emotion_logs": emotion_logs,
+    }
+    data["report"] = {
+        "rows": len(rows), "candidates": len(candidates), "questions": len(questions),
+        "answers": len(answers), "skills": len(skills), "roles": len(roles),
+        "companies": len(companies), "interviews": len(interviews), "emotion_logs": len(emotion_logs),
+        "missing_columns": missing_cols, "columns_found": sorted(rows[0].keys()),
+    }
+    return data
+```
+
+FILE: backend/app/schemas/candidate.py
+STATUS: NEW
+```python
+from typing import List, Optional
+
+from pydantic import BaseModel, Field
+
+
+class CandidateCreate(BaseModel):
+    candidate_id: Optional[str] = None
+    name: str = Field(min_length=1)
+    email: Optional[str] = None
+    education: Optional[str] = None
+    domain: Optional[str] = None
+    job_type: Optional[str] = None
+    experience_years: Optional[float] = Field(default=None, ge=0)
+    skills: List[str] = Field(default_factory=list)
+
+
+class CandidateUpdate(BaseModel):
+    name: Optional[str] = None
+    email: Optional[str] = None
+    education: Optional[str] = None
+    domain: Optional[str] = None
+    job_type: Optional[str] = None
+    experience_years: Optional[float] = Field(default=None, ge=0)
+    skills: Optional[List[str]] = None
+```
+
+FILE: backend/app/schemas/question.py
+STATUS: NEW
+```python
+from typing import List, Optional
+
+from pydantic import BaseModel, Field
+
+
+class QuestionCreate(BaseModel):
+    question_id: Optional[str] = None
+    text: str = Field(min_length=5)
+    category: Optional[str] = None
+    difficulty: Optional[str] = None
+    target_role: Optional[str] = None
+    experience: Optional[str] = None
+    keywords: List[str] = Field(default_factory=list)
+    skills: List[str] = Field(default_factory=list)
+
+
+class QuestionUpdate(BaseModel):
+    text: Optional[str] = Field(default=None, min_length=5)
+    category: Optional[str] = None
+    difficulty: Optional[str] = None
+    target_role: Optional[str] = None
+    experience: Optional[str] = None
+    keywords: Optional[List[str]] = None
+    skills: Optional[List[str]] = None
+```
+
+FILE: backend/app/schemas/interview.py
+STATUS: NEW
+```python
+from typing import List, Optional
+
+from pydantic import BaseModel, Field
+
+
+class InterviewQA(BaseModel):
+    question_id: str
+    answer_text: str = Field(min_length=1)
+    score: Optional[float] = Field(default=None, ge=0, le=10)
+
+
+class InterviewCreate(BaseModel):
+    candidate_id: str
+    round_label: Optional[str] = None
+    target_role: Optional[str] = None
+    notes: Optional[str] = None
+    qa: List[InterviewQA] = Field(min_length=1)
+
+
+class InterviewUpdate(BaseModel):
+    target_role: Optional[str] = None
+    notes: Optional[str] = None
+    status: Optional[str] = None
+```
+
+FILE: backend/app/schemas/evaluation.py
+STATUS: NEW
+```python
+from typing import Any, List, Optional
+
+from pydantic import BaseModel
+
+
+class EvaluationOut(BaseModel):
+    candidate_id: str
+    name: Optional[str] = None
+    role: Optional[str] = None
+    label: str
+    overall_score: float
+    technical_score: float
+    communication_score: float
+    skill_coverage: float
+    strengths: List[str]
+    weaknesses: List[str]
+    summary: str
+    explanation: List[str]
+    breakdown: dict[str, Any]
+```
+
+FILE: backend/app/services/shared.py
+STATUS: NEW
+```python
+"""Shared graph helpers used by several services."""
+
+from typing import Any
+
+from app.database.neo4j import run_cypher
+
+
+def run(query: str, **params: Any) -> list[dict]:
+    return run_cypher(query, params)
+
+
+def candidate_skill_map() -> dict[str, dict]:
+    rows = run("""
+        MATCH (c:Candidate)
+        OPTIONAL MATCH (c)-[:HAS_SKILL]->(s:Skill)
+        RETURN c.candidate_id AS id, c.name AS name, c.domain AS domain, collect(s.name) AS skills
+    """)
+    return {r["id"]: r for r in rows}
+
+
+def role_requirements() -> list[dict]:
+    return run("""
+        MATCH (r:Role)
+        OPTIONAL MATCH (s:Skill)-[rel:REQUIRED_FOR]->(r)
+        WITH r, s, rel ORDER BY rel.weight DESC
+        RETURN r.role_id AS role_id, r.title AS title, r.department AS department,
+               collect(CASE WHEN s IS NULL THEN NULL ELSE {name: s.name, weight: rel.weight} END) AS required
+        ORDER BY title
+    """)
+
+
+def interviewed_roles() -> dict[str, list[str]]:
+    rows = run("MATCH (c:Candidate)-[:INTERVIEWED_FOR]->(r:Role) RETURN c.candidate_id AS id, collect(r.title) AS roles")
+    return {r["id"]: r["roles"] for r in rows}
+
+
+def coverage(candidate_skills: list[str], required_names: list[str]) -> dict:
+    have = {s.lower() for s in candidate_skills}
+    matched = [n for n in required_names if n.lower() in have]
+    missing = [n for n in required_names if n.lower() not in have]
+    pct = round(100 * len(matched) / len(required_names), 1) if required_names else 0.0
+    return {"matched": matched, "missing": missing, "coverage": pct}
+
+
+def jaccard(a: list[str], b: list[str]) -> tuple[list[str], float]:
+    sa, sb = {s.lower(): s for s in a}, {s.lower(): s for s in b}
+    shared = [sa[k] for k in sa if k in sb]
+    union = len(set(sa) | set(sb))
+    return shared, round(100 * len(shared) / union, 1) if union else 0.0
+
+
+def best_role(cand_skills: list[str], reqs: list[dict], prefer: list[str] | None = None) -> dict | None:
+    pool = [r for r in reqs if prefer and r["title"] in prefer] or reqs
+    best = None
+    for r in pool:
+        names = [x["name"] for x in r["required"]]
+        cov = coverage(cand_skills, names)
+        if best is None or cov["coverage"] > best["coverage"]:
+            best = {"role_id": r["role_id"], "title": r["title"], "required": names, **cov}
+    return best
+```
+
+FILE: backend/app/services/candidate_service.py
+STATUS: NEW
+```python
+"""Candidate CRUD and read models (Neo4j + Mongo for emotion summary)."""
+
+import logging
+
+from app.database.mongodb import get_collection
+from app.schemas.candidate import CandidateCreate
+from app.services.shared import best_role, candidate_skill_map, interviewed_roles, role_requirements, run
+from app.utils.errors import ConflictError, NotFoundError
+from app.utils.helpers import new_id, skill_rows
+
+logger = logging.getLogger(__name__)
+
+
+def _exists(cid: str) -> bool:
+    return bool(run("MATCH (c:Candidate {candidate_id:$id}) RETURN c.candidate_id AS id", id=cid))
+
+
+def list_candidates(q=None, domain=None, job_type=None) -> dict:
+    rows = run("""
+        MATCH (c:Candidate)
+        OPTIONAL MATCH (c)-[:ANSWERED]->(a:Answer)
+        WITH c, avg(a.score) AS avg_score, count(a) AS answers
+        RETURN c.candidate_id AS candidate_id, c.name AS name, c.domain AS domain,
+               c.education AS education, c.experience_years AS experience_years,
+               c.job_type AS job_type, avg_score, answers
+        ORDER BY candidate_id
+    """)
+    smap, reqs, roles = candidate_skill_map(), role_requirements(), interviewed_roles()
+    items = []
+    for r in rows:
+        skills = smap.get(r["candidate_id"], {}).get("skills", [])
+        primary = best_role(skills, reqs, roles.get(r["candidate_id"]))
+        overall = best_role(skills, reqs)
+        items.append({
+            **r, "skills": skills,
+            "avg_score": round(r["avg_score"], 2) if r["avg_score"] is not None else None,
+            "primary_role": primary["title"] if primary else None,
+            "skill_coverage": primary["coverage"] if primary else 0,
+            "best_role": overall["title"] if overall else None,
+            "best_role_compat": overall["coverage"] if overall else 0,
+        })
+    facets = {
+        "domains": sorted({i["domain"] for i in items if i["domain"]}),
+        "job_types": sorted({i["job_type"] for i in items if i["job_type"]}),
+    }
+    if q:
+        ql = q.lower()
+        items = [i for i in items if ql in " ".join(
+            [str(i["candidate_id"]), str(i["name"]), str(i["education"] or ""), " ".join(i["skills"])]).lower()]
+    if domain:
+        items = [i for i in items if i["domain"] == domain]
+    if job_type:
+        items = [i for i in items if i["job_type"] == job_type]
+    return {"items": items, "total": len(items), "facets": facets}
+
+
+def get_candidate(cid: str) -> dict:
+    base = run("""
+        MATCH (c:Candidate {candidate_id:$id})
+        RETURN c.candidate_id AS candidate_id, c.name AS name, c.email AS email, c.education AS education,
+               c.domain AS domain, c.experience_years AS experience_years, c.job_type AS job_type,
+               c.experience_text AS experience_text
+    """, id=cid)
+    if not base:
+        raise NotFoundError(f"Candidate {cid} not found")
+    skills = [r["name"] for r in run(
+        "MATCH (:Candidate {candidate_id:$id})-[:HAS_SKILL]->(s:Skill) RETURN s.name AS name ORDER BY name", id=cid)]
+    rounds = run("""
+        MATCH (:Candidate {candidate_id:$id})-[:PARTICIPATES_IN]->(r:InterviewRound)
+        OPTIONAL MATCH (a:Answer {round_id:r.round_id})
+        RETURN r.round_id AS round_id, r.round_label AS round_label, r.round_number AS round_number,
+               r.date AS date, r.target_role AS target_role, count(a) AS answers
+        ORDER BY round_number
+    """, id=cid)
+    answers = run("""
+        MATCH (:Candidate {candidate_id:$id})-[:ANSWERED]->(a:Answer)-[:IN_RESPONSE_TO]->(q:Question)
+        OPTIONAL MATCH (a)-[:DEMONSTRATES]->(s:Skill)
+        RETURN a.answer_id AS answer_id, a.round_id AS round_id, a.score AS score, q.question_id AS question_id,
+               q.text AS question, q.difficulty AS difficulty, q.category AS category,
+               collect(DISTINCT s.name) AS skills
+        ORDER BY round_id, question_id
+    """, id=cid)
+    scores = [a["score"] for a in answers if a["score"] is not None]
+    try:
+        emotions = list(get_collection("emotion_logs").aggregate([
+            {"$match": {"candidate_id": cid}},
+            {"$group": {"_id": "$label", "count": {"$sum": 1}, "avg_confidence": {"$avg": "$confidence"}}},
+            {"$project": {"_id": 0, "label": "$_id", "count": 1, "avg_confidence": {"$round": ["$avg_confidence", 2]}}},
+            {"$sort": {"count": -1}},
+        ]))
+    except Exception as exc:  # MongoDB unavailable -> graceful degradation
+        logger.warning("Emotion summary unavailable: %s", exc)
+        emotions = []
+    return {
+        "candidate": base[0], "skills": skills, "rounds": rounds, "answers": answers, "emotions": emotions,
+        "stats": {"avg_score": round(sum(scores) / len(scores), 2) if scores else None,
+                  "answers": len(answers), "rounds": len(rounds)},
+    }
+
+
+def _set_skills(cid: str, skills: list[str]) -> None:
+    run("MATCH (:Candidate {candidate_id:$id})-[h:HAS_SKILL]->() DELETE h", id=cid)
+    rows = skill_rows(skills)
+    if rows:
+        run("""
+            MATCH (c:Candidate {candidate_id:$id})
+            UNWIND $rows AS r
+            MERGE (s:Skill {skill_id:r.id}) ON CREATE SET s.name=r.name, s.category=r.category
+            MERGE (c)-[:HAS_SKILL]->(s)
+        """, id=cid, rows=rows)
+    run("MATCH (c:Candidate {candidate_id:$id}) SET c.skills=$skills", id=cid, skills=[r["name"] for r in rows])
+
+
+def create_candidate(p: CandidateCreate) -> dict:
+    cid = p.candidate_id or new_id("C")
+    if _exists(cid):
+        raise ConflictError(f"Candidate {cid} already exists")
+    run("""
+        CREATE (c:Candidate {candidate_id:$id, name:$name, email:$email, education:$education,
+                             domain:$domain, job_type:$job_type, experience_years:$exp})
+    """, id=cid, name=p.name, email=p.email, education=p.education, domain=p.domain,
+        job_type=p.job_type, exp=p.experience_years)
+    _set_skills(cid, p.skills)
+    return get_candidate(cid)
+
+
+def update_candidate(cid: str, data: dict) -> dict:
+    if not _exists(cid):
+        raise NotFoundError(f"Candidate {cid} not found")
+    skills = data.pop("skills", None)
+    if data:
+        props = {("experience_years" if k == "experience_years" else k): v for k, v in data.items()}
+        run("MATCH (c:Candidate {candidate_id:$id}) SET c += $props", id=cid, props=props)
+    if skills is not None:
+        _set_skills(cid, skills)
+    return get_candidate(cid)
+
+
+def delete_candidate(cid: str) -> dict:
+    if not _exists(cid):
+        raise NotFoundError(f"Candidate {cid} not found")
+    run("MATCH (e:Emotion {candidate_id:$id}) DETACH DELETE e", id=cid)
+    run("MATCH (a:Answer {candidate_id:$id}) OPTIONAL MATCH (a)-[:RECEIVED]->(f:Feedback) DETACH DELETE f, a", id=cid)
+    run("MATCH (r:InterviewRound {candidate_id:$id}) DETACH DELETE r", id=cid)
+    run("MATCH (c:Candidate {candidate_id:$id}) DETACH DELETE c", id=cid)
+    mongo = {"interviews": 0, "emotion_logs": 0}
+    try:
+        mongo["interviews"] = get_collection("raw_interviews").delete_many({"candidate_id": cid}).deleted_count
+        mongo["emotion_logs"] = get_collection("emotion_logs").delete_many({"candidate_id": cid}).deleted_count
+    except Exception as exc:
+        logger.warning("Mongo cleanup skipped: %s", exc)
+    return {"deleted": cid, "mongo_removed": mongo}
+```
+
+FILE: backend/app/services/question_service.py
+STATUS: NEW
+```python
+"""Question bank CRUD."""
+
+from app.schemas.question import QuestionCreate
+from app.services.shared import run
+from app.utils.errors import ConflictError, NotFoundError
+from app.utils.helpers import new_id, skill_rows, slugify
+
+_WHERE = """
+    ($q IS NULL OR toLower(q.text) CONTAINS toLower($q))
+    AND ($category IS NULL OR q.category = $category)
+    AND ($difficulty IS NULL OR q.difficulty = $difficulty)
+    AND ($role IS NULL OR q.target_role = $role)
+    AND ($experience IS NULL OR q.experience = $experience)
+"""
+
+
+def list_questions(q=None, category=None, difficulty=None, role=None, experience=None, page=1, page_size=20) -> dict:
+    params = dict(q=q or None, category=category or None, difficulty=difficulty or None,
+                  role=role or None, experience=experience or None)
+    total = run(f"MATCH (q:Question) WHERE {_WHERE} RETURN count(q) AS n", **params)[0]["n"]
+    items = run(f"""
+        MATCH (q:Question) WHERE {_WHERE}
+        OPTIONAL MATCH (q)-[:TESTS_SKILL]->(s:Skill)
+        WITH q, collect(DISTINCT s.name) AS skills
+        ORDER BY q.question_id
+        SKIP $skip LIMIT $limit
+        RETURN q.question_id AS question_id, q.text AS text, q.category AS category,
+               q.difficulty AS difficulty, q.target_role AS target_role, q.experience AS experience, skills
+    """, skip=(page - 1) * page_size, limit=page_size, **params)
+    facets = run("""
+        MATCH (q:Question)
+        RETURN collect(DISTINCT q.category) AS categories, collect(DISTINCT q.difficulty) AS difficulties,
+               collect(DISTINCT q.target_role) AS roles, collect(DISTINCT q.experience) AS experiences
+    """)[0]
+    facets = {k: sorted(v) for k, v in facets.items()}
+    return {"items": items, "total": total, "page": page, "page_size": page_size, "facets": facets}
+
+
+def get_question(qid: str) -> dict:
+    rows = run("""
+        MATCH (q:Question {question_id:$id})
+        OPTIONAL MATCH (q)-[:TESTS_SKILL]->(s:Skill)
+        OPTIONAL MATCH (a:Answer)-[:IN_RESPONSE_TO]->(q)
+        RETURN q.question_id AS question_id, q.text AS text, q.category AS category, q.difficulty AS difficulty,
+               q.target_role AS target_role, q.experience AS experience, q.keywords AS keywords,
+               collect(DISTINCT s.name) AS skills, count(DISTINCT a) AS answers, round(avg(a.score), 2) AS avg_score
+    """, id=qid)
+    if not rows or rows[0]["question_id"] is None:
+        raise NotFoundError(f"Question {qid} not found")
+    return rows[0]
+
+
+def _set_skills(qid: str, skills: list[str]) -> None:
+    run("MATCH (:Question {question_id:$id})-[t:TESTS_SKILL]->() DELETE t", id=qid)
+    rows = skill_rows(skills)
+    if rows:
+        run("""
+            MATCH (q:Question {question_id:$id}) UNWIND $rows AS r
+            MERGE (s:Skill {skill_id:r.id}) ON CREATE SET s.name=r.name, s.category=r.category
+            MERGE (q)-[:TESTS_SKILL]->(s)
+        """, id=qid, rows=rows)
+
+
+def _set_role(qid: str, role: str | None) -> None:
+    run("MATCH (:Question {question_id:$id})-[f:FOR_ROLE]->() DELETE f", id=qid)
+    if role:
+        run("""
+            MATCH (q:Question {question_id:$id})
+            MERGE (r:Role {role_id:$rid}) ON CREATE SET r.title=$role
+            MERGE (q)-[:FOR_ROLE]->(r)
+        """, id=qid, rid="R-" + slugify(role), role=role)
+
+
+def create_question(p: QuestionCreate) -> dict:
+    qid = p.question_id or new_id("Q")
+    if run("MATCH (q:Question {question_id:$id}) RETURN q.question_id AS id", id=qid):
+        raise ConflictError(f"Question {qid} already exists")
+    run("""CREATE (q:Question {question_id:$id, text:$text, category:$category, difficulty:$difficulty,
+                               target_role:$role, experience:$exp, keywords:$kw})""",
+        id=qid, text=p.text, category=p.category, difficulty=p.difficulty, role=p.target_role,
+        exp=p.experience, kw=p.keywords)
+    _set_skills(qid, p.skills)
+    _set_role(qid, p.target_role)
+    return get_question(qid)
+
+
+def update_question(qid: str, data: dict) -> dict:
+    get_question(qid)
+    skills = data.pop("skills", None)
+    mapping = {"target_role": "target_role"}
+    props = {mapping.get(k, k): v for k, v in data.items()}
+    if props:
+        run("MATCH (q:Question {question_id:$id}) SET q += $props", id=qid, props=props)
+    if "target_role" in data:
+        _set_role(qid, data["target_role"])
+    if skills is not None:
+        _set_skills(qid, skills)
+    return get_question(qid)
+
+
+def delete_question(qid: str) -> dict:
+    get_question(qid)
+    run("""
+        MATCH (q:Question {question_id:$id})
+        OPTIONAL MATCH (a:Answer)-[:IN_RESPONSE_TO]->(q)
+        OPTIONAL MATCH (a)-[:RECEIVED]->(f:Feedback)
+        OPTIONAL MATCH (e:Emotion {answer_id: a.answer_id})
+        DETACH DELETE f, e, a, q
+    """, id=qid)
+    return {"deleted": qid}
+```
+
+FILE: backend/app/services/interview_service.py
+STATUS: NEW
+```python
+"""Interview sessions. Source of truth for flexible documents is MongoDB; graph is kept in sync."""
+
+import logging
+from datetime import datetime
+
+from app.database.mongodb import get_collection
+from app.schemas.interview import InterviewCreate, InterviewUpdate
+from app.seed.loader import score_answer
+from app.services.shared import run
+from app.utils.errors import ConflictError, NotFoundError
+from app.utils.helpers import new_id
+
+logger = logging.getLogger(__name__)
+
+
+def _col():
+    return get_collection("raw_interviews")
+
+
+def list_interviews(candidate_id=None, target_role=None, page=1, page_size=20) -> dict:
+    flt = {}
+    if candidate_id:
+        flt["candidate_id"] = candidate_id
+    if target_role:
+        flt["target_role"] = target_role
+    total = _col().count_documents(flt)
+    items = list(_col().aggregate([
+        {"$match": flt}, {"$sort": {"started_at": -1, "_id": 1}},
+        {"$skip": (page - 1) * page_size}, {"$limit": page_size},
+        {"$project": {"_id": 0, "interview_id": "$_id", "candidate_id": 1, "round_id": 1, "round_label": 1,
+                      "round_number": 1, "target_role": 1, "started_at": 1, "status": 1,
+                      "questions": {"$size": {"$ifNull": ["$qa", []]}},
+                      "avg_score": {"$round": [{"$avg": "$qa.score"}, 2]}}},
+    ]))
+    return {"items": items, "total": total, "page": page, "page_size": page_size}
+
+
+def get_interview(iid: str) -> dict:
+    doc = _col().find_one({"_id": iid})
+    if not doc:
+        raise NotFoundError(f"Interview {iid} not found")
+    doc["interview_id"] = doc.pop("_id")
+    try:  # enrich with graph relationships (feedback + demonstrated skills)
+        rows = run("""
+            MATCH (a:Answer {candidate_id:$cid, round_id:$rid})
+            OPTIONAL MATCH (a)-[:RECEIVED]->(f:Feedback)
+            OPTIONAL MATCH (a)-[:DEMONSTRATES]->(s:Skill)
+            RETURN a.answer_id AS answer_id, f.strengths AS strengths, f.weaknesses AS weaknesses,
+                   f.summary AS summary, collect(DISTINCT s.name) AS skills
+        """, cid=doc["candidate_id"], rid=iid)
+        by_id = {r["answer_id"]: r for r in rows}
+        for qa in doc.get("qa", []):
+            g = by_id.get(qa.get("answer_id"))
+            if g:
+                qa["feedback"] = {"strengths": g["strengths"], "weaknesses": g["weaknesses"], "summary": g["summary"]}
+                qa["skills_demonstrated"] = g["skills"]
+    except Exception as exc:
+        logger.warning("Graph enrichment skipped: %s", exc)
+    return doc
+
+
+def _sync_graph(doc: dict) -> None:
+    run("""
+        MATCH (c:Candidate {candidate_id:$cid})
+        MERGE (r:InterviewRound {round_id:$rid})
+        SET r.round_number=$num, r.round_label=$label, r.date=$date, r.candidate_id=$cid, r.target_role=$role
+        MERGE (c)-[:PARTICIPATES_IN]->(r)
+    """, cid=doc["candidate_id"], rid=doc["_id"], num=doc["round_number"], label=doc["round_label"],
+        date=doc["started_at"].date().isoformat(), role=doc.get("target_role"))
+    run("""
+        UNWIND $qa AS x
+        MATCH (c:Candidate {candidate_id:$cid}) MATCH (q:Question {question_id:x.question_id})
+        MATCH (r:InterviewRound {round_id:$rid})
+        MERGE (a:Answer {answer_id:x.answer_id})
+        SET a.transcript_text=x.answer, a.score=x.score, a.timestamp=x.timestamp, a.candidate_id=$cid,
+            a.round_id=$rid, a.question_id=x.question_id, a.word_count=size(split(x.answer, ' '))
+        MERGE (c)-[:ANSWERED]->(a) MERGE (a)-[:IN_RESPONSE_TO]->(q) MERGE (r)-[:INCLUDES]->(q)
+    """, cid=doc["candidate_id"], rid=doc["_id"], qa=doc["qa"])
+
+
+def create_interview(p: InterviewCreate) -> dict:
+    if not run("MATCH (c:Candidate {candidate_id:$id}) RETURN 1 AS ok", id=p.candidate_id):
+        raise NotFoundError(f"Candidate {p.candidate_id} not found")
+    n = _col().count_documents({"candidate_id": p.candidate_id})
+    label = p.round_label or f"R{n + 1}"
+    iid = f"{p.candidate_id}__{label}"
+    if _col().find_one({"_id": iid}):
+        raise ConflictError(f"Interview {iid} already exists")
+    qrows = run("""MATCH (q:Question) WHERE q.question_id IN $ids
+                   RETURN q.question_id AS id, q.text AS text, q.category AS category, q.difficulty AS difficulty,
+                          q.keywords AS keywords, q.target_role AS role""",
+                ids=[x.question_id for x in p.qa])
+    qmap = {r["id"]: r for r in qrows}
+    missing = [x.question_id for x in p.qa if x.question_id not in qmap]
+    if missing:
+        raise NotFoundError(f"Unknown question ids: {', '.join(missing)}")
+    start = datetime.utcnow().replace(microsecond=0)
+    qa, transcript = [], []
+    for idx, item in enumerate(p.qa):
+        q = qmap[item.question_id]
+        score = item.score if item.score is not None else score_answer(item.answer_text, q["keywords"] or [], 0)[0]
+        t = 120 + idx * 240
+        qa.append({"question_id": q["id"], "question": q["text"], "category": q["category"],
+                   "difficulty": q["difficulty"], "answer_id": new_id("A"), "answer": item.answer_text,
+                   "score": score, "skills_tested": [], "keywords": q["keywords"] or [],
+                   "timestamp": start.isoformat(), "timestamp_sec": t})
+        transcript += [{"speaker": "interviewer", "text": q["text"], "t": t},
+                       {"speaker": "candidate", "text": item.answer_text, "t": t + 30}]
+    doc = {"_id": iid, "candidate_id": p.candidate_id, "round_id": iid, "round_label": label,
+           "round_number": n + 1, "target_role": p.target_role or qrows[0]["role"], "started_at": start,
+           "status": "completed", "transcript": transcript, "qa": qa, "emotion_timeline": [],
+           "metadata": {"synthetic": False, "created_via": "api", "notes": p.notes or ""}}
+    _col().insert_one(doc)
+    _sync_graph(doc)
+    return get_interview(iid)
+
+
+def update_interview(iid: str, p: InterviewUpdate) -> dict:
+    data = p.model_dump(exclude_unset=True)
+    sets = {k: v for k, v in data.items() if k in ("target_role", "status")}
+    if "notes" in data:
+        sets["metadata.notes"] = data["notes"]
+    sets["metadata.updated_at"] = datetime.utcnow().isoformat()
+    res = _col().update_one({"_id": iid}, {"$set": sets})
+    if res.matched_count == 0:
+        raise NotFoundError(f"Interview {iid} not found")
+    if "target_role" in data:
+        run("MATCH (r:InterviewRound {round_id:$id}) SET r.target_role=$role", id=iid, role=data["target_role"])
+    return get_interview(iid)
+
+
+def delete_interview(iid: str) -> dict:
+    doc = _col().find_one({"_id": iid}, {"candidate_id": 1})
+    if not doc:
+        raise NotFoundError(f"Interview {iid} not found")
+    _col().delete_one({"_id": iid})
+    removed = get_collection("emotion_logs").delete_many({"interview_id": iid}).deleted_count
+    run("MATCH (e:Emotion {candidate_id:$cid}) WHERE e.answer_id IN [(a:Answer {round_id:$rid}) | a.answer_id] DETACH DELETE e",
+        cid=doc["candidate_id"], rid=iid)
+    run("MATCH (a:Answer {round_id:$rid}) OPTIONAL MATCH (a)-[:RECEIVED]->(f:Feedback) DETACH DELETE f, a", rid=iid)
+    run("MATCH (r:InterviewRound {round_id:$rid}) DETACH DELETE r", rid=iid)
+    return {"deleted": iid, "emotion_logs_removed": removed}
+```
+
+FILE: backend/app/services/evaluation_service.py
+STATUS: NEW
+```python
+"""Deterministic, explainable candidate evaluation (no LLM, no paid API)."""
+
+from app.services.shared import best_role, candidate_skill_map, interviewed_roles, role_requirements, run
+from app.utils.errors import NotFoundError
+
+LABEL = "System-generated evaluation based on synthetic interview data."
+DIFF_WEIGHT = {"easy": 1.0, "medium": 1.5, "hard": 2.0}
+BEHAVIORAL_HINTS = ("behav", "hr", "situation", "soft", "culture", "leadership", "communication")
+
+
+def _is_behavioral(category: str | None) -> bool:
+    c = (category or "").lower()
+    return any(h in c for h in BEHAVIORAL_HINTS)
+
+
+def _avg(values: list[float]) -> float:
+    return sum(values) / len(values) if values else 0.0
+
+
+def compute_evaluation(answers: list[dict], coverage_pct: float, matched: list[str], missing: list[str],
+                       role: str | None = None) -> dict:
+    """Pure function (unit-testable). Scores are on a 0-10 scale; coverage is a percentage."""
+    scored = [a for a in answers if a.get("score") is not None]
+    tech_pool = [a for a in scored if not _is_behavioral(a.get("category"))] or scored
+    beh_pool = [a for a in scored if _is_behavioral(a.get("category"))]
+
+    wsum = sum(DIFF_WEIGHT.get((a.get("difficulty") or "").lower(), 1.0) for a in tech_pool)
+    technical = sum(a["score"] * DIFF_WEIGHT.get((a.get("difficulty") or "").lower(), 1.0) for a in tech_pool) / wsum if wsum else 0.0
+    length_score = _avg([min((a.get("word_count") or 0) / 80, 1.0) * 10 for a in scored])
+    beh_score = _avg([a["score"] for a in beh_pool]) if beh_pool else _avg([a["score"] for a in scored])
+    communication = 0.5 * length_score + 0.5 * beh_score
+    overall = 0.5 * technical + 0.2 * communication + 0.3 * (coverage_pct / 10)
+
+    by_cat: dict[str, list[float]] = {}
+    by_skill: dict[str, list[float]] = {}
+    for a in scored:
+        by_cat.setdefault(a.get("category") or "General", []).append(a["score"])
+        for s in a.get("skills") or []:
+            by_skill.setdefault(s, []).append(a["score"])
+
+    strengths = [f"Strong performance in {c} questions (average {_avg(v):.1f}/10)" for c, v in by_cat.items() if _avg(v) >= 7]
+    strengths += [f"Skill evidence: {s} (average {_avg(v):.1f}/10)" for s, v in
+                  sorted(by_skill.items(), key=lambda kv: -_avg(kv[1])) if _avg(v) >= 7][:3]
+    if matched:
+        strengths.append("Holds role skills: " + ", ".join(matched[:5]))
+    weaknesses = [f"Below-average performance in {c} questions (average {_avg(v):.1f}/10)" for c, v in by_cat.items() if _avg(v) < 5]
+    weaknesses += [f"Missing role skill: {m}" for m in missing[:5]]
+    hard_low = [a for a in scored if (a.get("difficulty") or "").lower() == "hard" and a["score"] < 5]
+    if hard_low:
+        weaknesses.append(f"{len(hard_low)} hard question(s) scored below 5/10")
+
+    summary = (f"Overall {overall:.1f}/10 (technical {technical:.1f}, communication {communication:.1f}); "
+               f"skill coverage {coverage_pct:.0f}%" + (f" for {role}." if role else "."))
+    explanation = [
+        f"Technical = difficulty-weighted mean of answer scores (Easy 1.0, Medium 1.5, Hard 2.0) over {len(tech_pool)} answers = {technical:.2f}.",
+        f"Communication = 0.5 * answer-length score ({length_score:.2f}) + 0.5 * behavioural/overall score ({beh_score:.2f}) = {communication:.2f}.",
+        f"Skill coverage = matched required skills / required skills for the role = {coverage_pct:.1f}%.",
+        f"Overall = 0.5*technical + 0.2*communication + 0.3*(coverage/10) = {overall:.2f}.",
+        "Answer score = 10 * (0.55*keyword coverage + 0.25*length factor + 0.20*skill evidence), computed at seed time.",
+    ]
+    return {
+        "overall_score": round(overall, 1), "technical_score": round(technical, 1),
+        "communication_score": round(communication, 1), "skill_coverage": round(coverage_pct, 1),
+        "strengths": strengths or ["No standout strengths detected from the available data"],
+        "weaknesses": weaknesses or ["No significant weaknesses detected from the available data"],
+        "summary": summary, "explanation": explanation,
+        "breakdown": {"answers": len(scored), "by_category": {c: round(_avg(v), 2) for c, v in by_cat.items()},
+                      "matched_skills": matched, "missing_skills": missing},
+    }
+
+
+def evaluate_candidate(cid: str) -> dict:
+    cand = candidate_skill_map().get(cid)
+    if not cand:
+        raise NotFoundError(f"Candidate {cid} not found")
+    answers = run("""
+        MATCH (:Candidate {candidate_id:$id})-[:ANSWERED]->(a:Answer)-[:IN_RESPONSE_TO]->(q:Question)
+        OPTIONAL MATCH (a)-[:DEMONSTRATES]->(s:Skill)
+        RETURN a.answer_id AS answer_id, a.score AS score, a.word_count AS word_count,
+               q.difficulty AS difficulty, q.category AS category, collect(DISTINCT s.name) AS skills
+    """, id=cid)
+    role = best_role(cand["skills"], role_requirements(), interviewed_roles().get(cid))
+    result = compute_evaluation(answers, role["coverage"] if role else 0.0,
+                                role["matched"] if role else [], role["missing"] if role else [],
+                                role["title"] if role else None)
+    return {"candidate_id": cid, "name": cand["name"], "role": role["title"] if role else None,
+            "label": LABEL, **result}
+```
+
+FILE: backend/app/services/recommendation_service.py
+STATUS: NEW
+```python
+"""Role compatibility, skill-gap analysis and similar candidates (transparent set arithmetic)."""
+
+from app.services.shared import candidate_skill_map, coverage, jaccard, role_requirements
+from app.utils.errors import NotFoundError
+
+LABEL = "System-generated role compatibility (skill overlap), not a hiring decision."
+
+
+def _candidate(cid: str) -> dict:
+    c = candidate_skill_map().get(cid)
+    if not c:
+        raise NotFoundError(f"Candidate {cid} not found")
+    return c
+
+
+def role_recommendations(cid: str) -> dict:
+    cand = _candidate(cid)
+    roles = []
+    for r in role_requirements():
+        names = [x["name"] for x in r["required"]]
+        roles.append({"role_id": r["role_id"], "title": r["title"], "required": names,
+                      **coverage(cand["skills"], names)})
+    roles.sort(key=lambda x: -x["coverage"])
+    return {"candidate_id": cid, "name": cand["name"], "label": LABEL, "roles": roles}
+
+
+def skill_gap(cid: str, role_id: str) -> dict:
+    cand = _candidate(cid)
+    role = next((r for r in role_requirements() if r["role_id"] == role_id or r["title"] == role_id), None)
+    if not role:
+        raise NotFoundError(f"Role {role_id} not found")
+    names = [x["name"] for x in role["required"]]
+    return {"candidate_id": cid, "role": {"role_id": role["role_id"], "title": role["title"]},
+            "required": names, **coverage(cand["skills"], names)}
+
+
+def similar_candidates(cid: str, limit: int = 5) -> dict:
+    cand = _candidate(cid)
+    out = []
+    for oid, o in candidate_skill_map().items():
+        if oid == cid:
+            continue
+        shared, pct = jaccard(cand["skills"], o["skills"])
+        if shared:
+            out.append({"candidate_id": oid, "name": o["name"], "domain": o["domain"],
+                        "shared_skills": shared, "similarity": pct})
+    out.sort(key=lambda x: -x["similarity"])
+    return {"candidate_id": cid, "method": "Jaccard similarity over HAS_SKILL relationships", "items": out[:limit]}
+```
+
+FILE: backend/app/services/graph_service.py
+STATUS: NEW
+```python
+"""Graph payloads for react-force-graph-2d, read live from Neo4j."""
+
+from app.services.shared import run
+from app.utils.errors import NotFoundError
+
+DEFAULT_TYPES = ["Candidate", "Question", "Skill", "Role", "Company", "Answer", "Technology", "InterviewRound"]
+_KEY = ("labels({v})[0] + ':' + toString(coalesce({v}.candidate_id, {v}.question_id, {v}.skill_id, {v}.role_id, "
+        "{v}.company_id, {v}.answer_id, {v}.tech_id, {v}.round_id, {v}.emotion_id, {v}.feedback_id))")
+_NAME = "coalesce({v}.name, {v}.title, {v}.answer_id, {v}.round_id, {v}.text)"
+
+
+def _k(v: str) -> str:
+    return _KEY.replace("{v}", v)
+
+
+def _shorten(value, n=300):
+    return value[:n] + "…" if isinstance(value, str) and len(value) > n else value
+
+
+def _node(r: dict) -> dict:
+    name = str(r["name"] or r["id"])
+    return {"id": r["id"], "type": r["type"], "name": name if len(name) <= 60 else name[:57] + "…",
+            "props": {k: _shorten(v) for k, v in (r["props"] or {}).items()}}
+
+
+def _stats(nodes: list, links: list) -> dict:
+    by_type: dict[str, int] = {}
+    for n in nodes:
+        by_type[n["type"]] = by_type.get(n["type"], 0) + 1
+    return {"nodes": len(nodes), "links": len(links), "by_type": by_type}
+
+
+def _links_between(keys: list[str]) -> list[dict]:
+    rows = run(f"""
+        MATCH (a)-[r]->(b)
+        WHERE {_k('a')} IN $keys AND {_k('b')} IN $keys
+        RETURN {_k('a')} AS source, {_k('b')} AS target, type(r) AS type
+    """, keys=keys)
+    return rows
+
+
+def full_graph(types: list[str] | None = None) -> dict:
+    types = [t for t in (types or DEFAULT_TYPES) if t in DEFAULT_TYPES + ["Emotion", "Feedback"]]
+    nodes = [_node(r) for r in run(f"""
+        MATCH (n) WHERE labels(n)[0] IN $types
+        RETURN labels(n)[0] AS type, {_k('n')} AS id, {_NAME.replace('{v}', 'n')} AS name, properties(n) AS props
+    """, types=types)]
+    links = run(f"""
+        MATCH (a)-[r]->(b)
+        WHERE labels(a)[0] IN $types AND labels(b)[0] IN $types
+        RETURN {_k('a')} AS source, {_k('b')} AS target, type(r) AS type
+    """, types=types)
+    return {"nodes": nodes, "links": links, "stats": _stats(nodes, links)}
+
+
+def candidate_graph(cid: str) -> dict:
+    rows = run(f"""
+        MATCH (c:Candidate {{candidate_id:$id}})
+        CALL {{
+            WITH c RETURN c AS n
+            UNION WITH c MATCH (c)-[:ANSWERED]->(n:Answer) RETURN n
+            UNION WITH c MATCH (c)-[:ANSWERED]->(:Answer)-[:IN_RESPONSE_TO]->(n:Question) RETURN n
+            UNION WITH c MATCH (c)-[:PARTICIPATES_IN]->(n:InterviewRound) RETURN n
+            UNION WITH c MATCH (c)-[:HAS_SKILL]->(n:Skill) RETURN n
+            UNION WITH c MATCH (c)-[:INTERVIEWED_FOR]->(n:Role) RETURN n
+            UNION WITH c MATCH (c)-[:HAS_SKILL]->(:Skill)-[:RELATED_TO]->(n:Technology) RETURN n
+        }}
+        RETURN DISTINCT labels(n)[0] AS type, {_k('n')} AS id, {_NAME.replace('{v}', 'n')} AS name, properties(n) AS props
+    """, id=cid)
+    if not rows:
+        raise NotFoundError(f"Candidate {cid} not found")
+    nodes = [_node(r) for r in rows]
+    links = _links_between([n["id"] for n in nodes])
+    return {"nodes": nodes, "links": links, "stats": _stats(nodes, links)}
+```
+
+FILE: backend/app/services/analytics_service.py
+STATUS: NEW
+```python
+"""Neo4j analytics, GDS algorithms (with graceful fallback) and MongoDB aggregations."""
+
+import logging
+
+from app.database.mongodb import get_collection
+from app.services.shared import candidate_skill_map, jaccard, run
+from app.utils.errors import BadRequestError
+
+logger = logging.getLogger(__name__)
+
+
+# ------------------------------------------------------------------ dashboard
+def dashboard_summary() -> dict:
+    labels = {r["l"]: r["c"] for r in run("MATCH (n) RETURN labels(n)[0] AS l, count(*) AS c")}
+    rels = run("MATCH ()-[r]->() RETURN count(r) AS c")[0]["c"]
+    avg = run("MATCH (a:Answer) RETURN round(avg(a.score), 2) AS v")[0]["v"]
+    mongo = {"interviews": 0, "emotion_logs": 0, "available": True}
+    emotion_dist: list = []
+    try:
+        mongo["interviews"] = get_collection("raw_interviews").count_documents({})
+        mongo["emotion_logs"] = get_collection("emotion_logs").count_documents({})
+        emotion_dist = mongo_aggregations()["emotion_distribution"]
+    except Exception as exc:
+        logger.warning("MongoDB unavailable for dashboard: %s", exc)
+        mongo["available"] = False
+    charts = {
+        "candidates_by_domain": run("MATCH (c:Candidate) RETURN coalesce(c.domain,'Unknown') AS name, count(*) AS value ORDER BY value DESC"),
+        "questions_by_difficulty": run("MATCH (q:Question) RETURN coalesce(q.difficulty,'Unknown') AS name, count(*) AS value ORDER BY value DESC"),
+        "role_distribution": run("MATCH (c:Candidate)-[:INTERVIEWED_FOR]->(r:Role) RETURN r.title AS name, count(DISTINCT c) AS value ORDER BY value DESC"),
+        "skill_distribution": run("MATCH (c:Candidate)-[:HAS_SKILL]->(s:Skill) RETURN s.name AS name, count(DISTINCT c) AS value ORDER BY value DESC LIMIT 12"),
+        "score_by_role": run("MATCH (a:Answer)-[:IN_RESPONSE_TO]->(q:Question) RETURN coalesce(q.target_role,'Unknown') AS name, round(avg(a.score), 2) AS value ORDER BY value DESC"),
+        "rounds_per_candidate": run("MATCH (c:Candidate)-[:PARTICIPATES_IN]->(r:InterviewRound) RETURN c.candidate_id AS name, count(r) AS value ORDER BY value DESC, name LIMIT 15"),
+        "emotion_distribution": [{"name": e["label"], "value": e["count"]} for e in emotion_dist],
+    }
+    counts = {
+        "candidates": labels.get("Candidate", 0), "questions": labels.get("Question", 0),
+        "answers": labels.get("Answer", 0), "skills": labels.get("Skill", 0), "roles": labels.get("Role", 0),
+        "companies": labels.get("Company", 0), "technologies": labels.get("Technology", 0),
+        "rounds": labels.get("InterviewRound", 0), "relationships": rels,
+        "interviews": mongo["interviews"], "emotion_logs": mongo["emotion_logs"],
+    }
+    return {"counts": counts, "avg_score": avg, "mongodb_available": mongo["available"], "charts": charts}
+
+
+# ------------------------------------------------------------------ neo4j analytics
+def overview() -> dict:
+    return {
+        "avg_score": run("MATCH (a:Answer) RETURN round(avg(a.score), 2) AS v")[0]["v"],
+        "top_candidates": run("""
+            MATCH (c:Candidate)-[:ANSWERED]->(a:Answer)
+            RETURN c.candidate_id AS candidate_id, c.name AS name, round(avg(a.score), 2) AS avg_score, count(a) AS answers
+            ORDER BY avg_score DESC LIMIT 5"""),
+        "category_performance": run("""
+            MATCH (a:Answer)-[:IN_RESPONSE_TO]->(q:Question)
+            RETURN coalesce(q.category,'Unknown') AS name, round(avg(a.score), 2) AS avg_score, count(a) AS count
+            ORDER BY avg_score DESC"""),
+        "domain_performance": run("""
+            MATCH (c:Candidate)-[:ANSWERED]->(a:Answer)
+            RETURN coalesce(c.domain,'Unknown') AS name, round(avg(a.score), 2) AS avg_score, count(DISTINCT c) AS candidates
+            ORDER BY avg_score DESC"""),
+    }
+
+
+def skills_analytics(skill: str | None = None) -> dict:
+    top = run("""
+        MATCH (s:Skill)
+        OPTIONAL MATCH (c:Candidate)-[:HAS_SKILL]->(s)
+        WITH s, count(DISTINCT c) AS candidates
+        OPTIONAL MATCH (q:Question)-[:TESTS_SKILL]->(s)
+        WITH s, candidates, count(DISTINCT q) AS questions
+        OPTIONAL MATCH (s)-[:REQUIRED_FOR]->(r:Role)
+        WITH s, candidates, questions, count(DISTINCT r) AS roles
+        OPTIONAL MATCH (a:Answer)-[:DEMONSTRATES]->(s)
+        RETURN s.name AS name, s.category AS category, candidates, questions, roles,
+               count(DISTINCT a) AS evidence, round(avg(a.score), 2) AS avg_score
+        ORDER BY candidates + questions DESC, name""")
+    cooc = run("""
+        MATCH (q:Question)-[:TESTS_SKILL]->(a:Skill), (q)-[:TESTS_SKILL]->(b:Skill)
+        WHERE a.skill_id < b.skill_id
+        RETURN a.name AS a, b.name AS b, count(DISTINCT q) AS count ORDER BY count DESC LIMIT 15""")
+    out = {"top_skills": top, "cooccurrence": cooc, "strongest": []}
+    if skill:
+        out["strongest"] = run("""
+            MATCH (c:Candidate)-[:ANSWERED]->(a:Answer)-[:DEMONSTRATES]->(s:Skill)
+            WHERE toLower(s.name) = toLower($skill)
+            RETURN c.candidate_id AS candidate_id, c.name AS name, round(avg(a.score), 2) AS avg_score, count(a) AS evidence
+            ORDER BY avg_score DESC, evidence DESC LIMIT 10""", skill=skill)
+    return out
+
+
+def roles_analytics() -> dict:
+    return {"roles": run("""
+        MATCH (r:Role)
+        OPTIONAL MATCH (s:Skill)-[:REQUIRED_FOR]->(r)
+        WITH r, count(DISTINCT s) AS required_skills
+        OPTIONAL MATCH (q:Question)-[:FOR_ROLE]->(r)
+        WITH r, required_skills, count(DISTINCT q) AS questions
+        OPTIONAL MATCH (c:Candidate)-[:INTERVIEWED_FOR]->(r)
+        WITH r, required_skills, questions, count(DISTINCT c) AS candidates
+        OPTIONAL MATCH (a:Answer)-[:IN_RESPONSE_TO]->(:Question)-[:FOR_ROLE]->(r)
+        RETURN r.title AS title, r.department AS department, required_skills, questions, candidates,
+               round(avg(a.score), 2) AS avg_score
+        ORDER BY title""")}
+
+
+def difficulties_analytics() -> dict:
+    return {
+        "by_difficulty": run("""
+            MATCH (q:Question) OPTIONAL MATCH (a:Answer)-[:IN_RESPONSE_TO]->(q)
+            RETURN coalesce(q.difficulty,'Unknown') AS difficulty, count(DISTINCT q) AS questions,
+                   count(a) AS answers, round(avg(a.score), 2) AS avg_score ORDER BY difficulty"""),
+        "hardest": run("""
+            MATCH (a:Answer)-[:IN_RESPONSE_TO]->(q:Question)
+            WITH q, avg(a.score) AS avg_score, count(a) AS answers
+            RETURN q.question_id AS question_id, q.text AS text, q.difficulty AS difficulty,
+                   round(avg_score, 2) AS avg_score, answers
+            ORDER BY avg_score ASC LIMIT 10"""),
+    }
+
+
+# ------------------------------------------------------------------ GDS (with fallbacks)
+def _with_projection(name: str, nodes: list[str], rels: dict, algo: str) -> list[dict]:
+    try:
+        run("CALL gds.graph.drop($name, false)", name=name)
+        run("CALL gds.graph.project($name, $nodes, $rels)", name=name, nodes=nodes, rels=rels)
+        return run(algo, name=name)
+    finally:
+        try:
+            run("CALL gds.graph.drop($name, false)", name=name)
+        except Exception:
+            pass
+
+
+def _pagerank() -> dict:
+    try:
+        items = _with_projection(
+            "ikgRank", ["Skill", "Question", "Candidate"],
+            {"TESTS_SKILL": {"orientation": "NATURAL"}, "HAS_SKILL": {"orientation": "NATURAL"}},
+            """CALL gds.pageRank.stream($name) YIELD nodeId, score
+               WITH gds.util.asNode(nodeId) AS n, score WHERE n:Skill
+               RETURN n.name AS name, round(score, 4) AS score ORDER BY score DESC LIMIT 10""")
+        return {"engine": "gds", "algorithm": "PageRank", "items": items}
+    except Exception as exc:
+        items = run("""MATCH (s:Skill) OPTIONAL MATCH (s)<-[r:TESTS_SKILL|HAS_SKILL]-()
+                       RETURN s.name AS name, count(r) AS score ORDER BY score DESC LIMIT 10""")
+        return {"engine": "fallback", "algorithm": "Degree centrality", "note": f"GDS unavailable: {str(exc)[:120]}", "items": items}
+
+
+def _louvain() -> dict:
+    try:
+        items = _with_projection(
+            "ikgCommunity", ["Skill", "Question"], {"TESTS_SKILL": {"orientation": "UNDIRECTED"}},
+            """CALL gds.louvain.stream($name) YIELD nodeId, communityId
+               WITH gds.util.asNode(nodeId) AS n, communityId WHERE n:Skill
+               RETURN communityId AS community, collect(n.name) AS skills ORDER BY size(skills) DESC""")
+        return {"engine": "gds", "algorithm": "Louvain", "items": items}
+    except Exception as exc:
+        items = run("MATCH (s:Skill) RETURN s.category AS community, collect(s.name) AS skills ORDER BY size(skills) DESC")
+        return {"engine": "fallback", "algorithm": "Grouping by skill category", "note": f"GDS unavailable: {str(exc)[:120]}", "items": items}
+
+
+def _similarity() -> dict:
+    try:
+        items = _with_projection(
+            "ikgSim", ["Candidate", "Skill"], {"HAS_SKILL": {"orientation": "NATURAL"}},
+            """CALL gds.nodeSimilarity.stream($name) YIELD node1, node2, similarity
+               WITH gds.util.asNode(node1) AS a, gds.util.asNode(node2) AS b, similarity
+               WHERE a.candidate_id < b.candidate_id
+               RETURN a.candidate_id AS a, b.candidate_id AS b, round(similarity, 3) AS similarity
+               ORDER BY similarity DESC LIMIT 10""")
+        return {"engine": "gds", "algorithm": "Node Similarity", "items": items}
+    except Exception as exc:
+        smap = candidate_skill_map()
+        ids, pairs = sorted(smap), []
+        for i, a in enumerate(ids):
+            for b in ids[i + 1:]:
+                shared, pct = jaccard(smap[a]["skills"], smap[b]["skills"])
+                if shared:
+                    pairs.append({"a": a, "b": b, "similarity": round(pct / 100, 3)})
+        pairs.sort(key=lambda x: -x["similarity"])
+        return {"engine": "fallback", "algorithm": "Jaccard (Python)", "note": f"GDS unavailable: {str(exc)[:120]}", "items": pairs[:10]}
+
+
+def gds_analytics() -> dict:
+    return {"pagerank": _pagerank(), "louvain": _louvain(), "similarity": _similarity()}
+
+
+# ------------------------------------------------------------------ MongoDB aggregations
+def mongo_aggregations() -> dict:
+    emo, iv = get_collection("emotion_logs"), get_collection("raw_interviews")
+    avg_conf = list(emo.aggregate([{"$group": {"_id": None, "avg": {"$avg": "$confidence"}, "samples": {"$sum": 1}}},
+                                   {"$project": {"_id": 0, "avg": {"$round": ["$avg", 3]}, "samples": 1}}]))
+    return {
+        "avg_emotion_confidence": avg_conf[0] if avg_conf else {"avg": None, "samples": 0},
+        "emotion_distribution": list(emo.aggregate([
+            {"$group": {"_id": "$label", "count": {"$sum": 1}, "avg_confidence": {"$avg": "$confidence"}}},
+            {"$project": {"_id": 0, "label": "$_id", "count": 1, "avg_confidence": {"$round": ["$avg_confidence", 3]}}},
+            {"$sort": {"count": -1}}])),
+        "interviews_per_role": list(iv.aggregate([
+            {"$group": {"_id": "$target_role", "interviews": {"$sum": 1}}},
+            {"$project": {"_id": 0, "role": "$_id", "interviews": 1}}, {"$sort": {"interviews": -1}}])),
+        "avg_answer_score": (list(iv.aggregate([
+            {"$unwind": "$qa"}, {"$group": {"_id": None, "avg": {"$avg": "$qa.score"}, "answers": {"$sum": 1}}},
+            {"$project": {"_id": 0, "avg": {"$round": ["$avg", 2]}, "answers": 1}}])) or [{"avg": None, "answers": 0}])[0],
+        "candidate_stats": list(iv.aggregate([
+            {"$unwind": "$qa"},
+            {"$group": {"_id": "$candidate_id", "interviews": {"$addToSet": "$_id"}, "answers": {"$sum": 1},
+                        "avg_score": {"$avg": "$qa.score"}}},
+            {"$project": {"_id": 0, "candidate_id": "$_id", "interviews": {"$size": "$interviews"}, "answers": 1,
+                          "avg_score": {"$round": ["$avg_score", 2]}}},
+            {"$sort": {"avg_score": -1}}, {"$limit": 10}])),
+        "emotion_trends": list(emo.aggregate([
+            {"$group": {"_id": {"phase": "$phase", "label": "$label"}, "count": {"$sum": 1},
+                        "avg_confidence": {"$avg": "$confidence"}}},
+            {"$project": {"_id": 0, "phase": "$_id.phase", "label": "$_id.label", "count": 1,
+                          "avg_confidence": {"$round": ["$avg_confidence", 3]}}},
+            {"$sort": {"phase": 1, "count": -1}}])),
+    }
+
+
+def catalog_skills() -> dict:
+    return {"items": run("""
+        MATCH (s:Skill)
+        OPTIONAL MATCH (c:Candidate)-[:HAS_SKILL]->(s)
+        WITH s, count(DISTINCT c) AS candidates
+        OPTIONAL MATCH (q:Question)-[:TESTS_SKILL]->(s)
+        RETURN s.skill_id AS skill_id, s.name AS name, s.category AS category, candidates, count(DISTINCT q) AS questions
+        ORDER BY candidates DESC, name""")}
+
+
+def catalog_roles() -> dict:
+    from app.services.shared import role_requirements
+    stats = {r["title"]: r for r in roles_analytics()["roles"]}
+    items = []
+    for r in role_requirements():
+        s = stats.get(r["title"], {})
+        items.append({"role_id": r["role_id"], "title": r["title"], "department": r["department"],
+                      "required_skills": r["required"], "questions": s.get("questions", 0),
+                      "candidates": s.get("candidates", 0), "avg_score": s.get("avg_score")})
+    return {"items": items}
+```
+
+FILE: backend/app/services/database_service.py
+STATUS: NEW
+```python
+"""Database introspection for the 'Database & NoSQL' page."""
+
+from app.config import get_settings
+from app.database.mongodb import get_mongo_database, verify_mongodb_connection
+from app.database.neo4j import verify_neo4j_connection
+from app.services.shared import run
+
+
+def _neo4j_indexes() -> dict:
+    return {
+        "constraints": run("SHOW CONSTRAINTS YIELD name, type, labelsOrTypes, properties RETURN name, type, labelsOrTypes, properties ORDER BY name"),
+        "indexes": run("SHOW INDEXES YIELD name, type, labelsOrTypes, properties, state RETURN name, type, labelsOrTypes, properties, state ORDER BY name"),
+    }
+
+
+def neo4j_info() -> dict:
+    ok = verify_neo4j_connection()
+    if not ok:
+        return {"connected": False, "uri": get_settings().neo4j_uri}
+    return {
+        "connected": True, "uri": get_settings().neo4j_uri,
+        "node_counts": run("MATCH (n) RETURN labels(n)[0] AS label, count(*) AS count ORDER BY count DESC"),
+        "relationship_counts": run("MATCH ()-[r]->() RETURN type(r) AS type, count(*) AS count ORDER BY count DESC"),
+        **_neo4j_indexes(),
+    }
+
+
+def mongodb_info() -> dict:
+    ok = verify_mongodb_connection()
+    settings = get_settings()
+    if not ok:
+        return {"connected": False, "database": settings.mongodb_database}
+    db = get_mongo_database()
+    cols = []
+    for name in sorted(db.list_collection_names()):
+        sample = db[name].find_one({}, {"transcript": 0})
+        if sample and isinstance(sample.get("qa"), list):
+            sample["qa"] = sample["qa"][:1]
+        if sample and isinstance(sample.get("emotion_timeline"), list):
+            sample["emotion_timeline"] = sample["emotion_timeline"][:2]
+        cols.append({"name": name, "documents": db[name].count_documents({}), "sample": sample})
+    return {"connected": True, "database": settings.mongodb_database, "collections": cols}
+
+
+def all_indexes() -> dict:
+    out = {"neo4j": None, "mongodb": {}}
+    try:
+        out["neo4j"] = _neo4j_indexes()
+    except Exception:
+        out["neo4j"] = {"constraints": [], "indexes": [], "error": "Neo4j unavailable"}
+    try:
+        db = get_mongo_database()
+        for name in sorted(db.list_collection_names()):
+            out["mongodb"][name] = [{"name": k, "keys": [list(x) for x in v["key"]]} for k, v in db[name].index_information().items()]
+    except Exception:
+        out["mongodb"] = {"error": "MongoDB unavailable"}
+    return out
+```
+
+FILE: backend/app/services/seed_service.py
+STATUS: NEW
+```python
+"""Idempotent seeding of Neo4j (MERGE) and MongoDB (upsert) from the synthetic CSV."""
+
+import logging
+from pathlib import Path
+
+from pymongo import ReplaceOne
+
+from app.database.mongodb import get_collection
+from app.database.neo4j import run_cypher
+from app.database.schema import init_mongo_indexes, init_neo4j_schema
+from app.seed.loader import find_dataset, read_rows, transform
+
+logger = logging.getLogger(__name__)
+
+Q = {
+    "skills": "UNWIND $rows AS r MERGE (s:Skill {skill_id:r.skill_id}) SET s.name=r.name, s.category=r.category",
+    "roles": "UNWIND $rows AS r MERGE (x:Role {role_id:r.role_id}) SET x.title=r.title, x.department=r.department",
+    "techs": "UNWIND $rows AS r MERGE (t:Technology {tech_id:r.tech_id}) SET t.name=r.name",
+    "companies": "UNWIND $rows AS r MERGE (c:Company {company_id:r.company_id}) SET c.name=r.name, c.industry=r.industry",
+    "candidates": """UNWIND $rows AS r MERGE (c:Candidate {candidate_id:r.candidate_id})
+        SET c.name=r.name, c.email=r.email, c.experience_years=r.experience_years, c.education=r.education,
+            c.domain=r.domain, c.job_type=r.job_type, c.skills=r.skills, c.source_id=r.source_id,
+            c.experience_text=r.experience_text, c.synthetic=true""",
+    "questions": """UNWIND $rows AS r MERGE (q:Question {question_id:r.question_id})
+        SET q.text=r.text, q.difficulty=r.difficulty, q.category=r.category, q.target_role=r.target_role,
+            q.experience=r.experience, q.keywords=r.keywords, q.synthetic=true
+        WITH q, r MATCH (ro:Role {role_id:r.role_id}) MERGE (q)-[:FOR_ROLE]->(ro)""",
+    "rounds": """UNWIND $rows AS r MATCH (c:Candidate {candidate_id:r.candidate_id})
+        MERGE (rd:InterviewRound {round_id:r.round_id})
+        SET rd.round_number=r.round_number, rd.round_label=r.round_label, rd.date=r.date,
+            rd.candidate_id=r.candidate_id, rd.target_role=r.target_role
+        MERGE (c)-[:PARTICIPATES_IN]->(rd)""",
+    "candidate_roles": """UNWIND $rows AS r MATCH (c:Candidate {candidate_id:r.candidate_id})
+        MATCH (ro:Role {role_id:r.role_id}) MERGE (c)-[:INTERVIEWED_FOR]->(ro)""",
+    "answers": """UNWIND $rows AS r
+        MATCH (c:Candidate {candidate_id:r.candidate_id}) MATCH (q:Question {question_id:r.question_id})
+        MATCH (rd:InterviewRound {round_id:r.round_id})
+        MERGE (a:Answer {answer_id:r.answer_id})
+        SET a.transcript_text=r.transcript_text, a.score=r.score, a.keyword_coverage=r.keyword_coverage,
+            a.word_count=r.word_count, a.timestamp=r.timestamp, a.candidate_id=r.candidate_id,
+            a.round_id=r.round_id, a.question_id=r.question_id
+        MERGE (c)-[:ANSWERED]->(a) MERGE (a)-[:IN_RESPONSE_TO]->(q) MERGE (rd)-[:INCLUDES]->(q)
+        MERGE (f:Feedback {feedback_id:r.feedback_id})
+        SET f.strengths=r.strengths, f.weaknesses=r.weaknesses, f.summary=r.summary
+        MERGE (a)-[:RECEIVED]->(f)
+        MERGE (e:Emotion {emotion_id:r.emotion_id})
+        SET e.label=r.emotion_label, e.confidence=r.emotion_confidence, e.candidate_id=r.candidate_id,
+            e.answer_id=r.answer_id
+        MERGE (c)-[:EXPRESSED]->(e)""",
+    "candidate_skills": "UNWIND $rows AS r MATCH (c:Candidate {candidate_id:r.candidate_id}) MATCH (s:Skill {skill_id:r.skill_id}) MERGE (c)-[:HAS_SKILL]->(s)",
+    "question_skills": "UNWIND $rows AS r MATCH (q:Question {question_id:r.question_id}) MATCH (s:Skill {skill_id:r.skill_id}) MERGE (q)-[:TESTS_SKILL]->(s)",
+    "answer_skills": "UNWIND $rows AS r MATCH (a:Answer {answer_id:r.answer_id}) MATCH (s:Skill {skill_id:r.skill_id}) MERGE (a)-[:DEMONSTRATES]->(s)",
+    "role_skills": "UNWIND $rows AS r MATCH (s:Skill {skill_id:r.skill_id}) MATCH (x:Role {role_id:r.role_id}) MERGE (s)-[rel:REQUIRED_FOR]->(x) SET rel.weight=r.weight",
+    "skill_tech": "UNWIND $rows AS r MATCH (s:Skill {skill_id:r.skill_id}) MATCH (t:Technology {tech_id:r.tech_id}) MERGE (s)-[:RELATED_TO]->(t)",
+    "candidate_companies": "UNWIND $rows AS r MATCH (c:Candidate {candidate_id:r.candidate_id}) MATCH (co:Company {company_id:r.company_id}) MERGE (c)-[:APPLIED_TO]->(co)",
+}
+ORDER = [("skills", "skills"), ("roles", "roles"), ("technologies", "techs"), ("companies", "companies"),
+         ("candidates", "candidates"), ("questions", "questions"), ("rounds", "rounds"),
+         ("candidate_roles", "candidate_roles"), ("answers", "answers"), ("candidate_skills", "candidate_skills"),
+         ("question_skills", "question_skills"), ("answer_skills", "answer_skills"), ("role_skills", "role_skills"),
+         ("skill_tech", "skill_tech"), ("candidate_companies", "candidate_companies")]
+
+
+def _batches(rows: list, size: int = 500):
+    for i in range(0, len(rows), size):
+        yield rows[i:i + size]
+
+
+def load_neo4j(data: dict) -> None:
+    for key, qname in ORDER:
+        rows = data.get(key) or []
+        for batch in _batches(rows):
+            run_cypher(Q[qname], {"rows": batch})
+
+
+def load_mongo(data: dict) -> None:
+    iv, emo = get_collection("raw_interviews"), get_collection("emotion_logs")
+    for coll, docs in ((iv, data["mongo_interviews"]), (emo, data["emotion_logs"])):
+        for batch in _batches(docs, 500):
+            coll.bulk_write([ReplaceOne({"_id": d["_id"]}, d, upsert=True) for d in batch], ordered=False)
+
+
+def stats() -> dict:
+    labels = {r["l"]: r["c"] for r in run_cypher("MATCH (n) RETURN labels(n)[0] AS l, count(*) AS c")}
+    rels = run_cypher("MATCH ()-[r]->() RETURN count(r) AS c")[0]["c"]
+    return {
+        "candidates": labels.get("Candidate", 0), "questions": labels.get("Question", 0),
+        "answers": labels.get("Answer", 0), "skills": labels.get("Skill", 0), "roles": labels.get("Role", 0),
+        "companies": labels.get("Company", 0), "technologies": labels.get("Technology", 0),
+        "rounds": labels.get("InterviewRound", 0), "relationships": rels,
+        "mongo_interviews": get_collection("raw_interviews").count_documents({}),
+        "emotion_logs": get_collection("emotion_logs").count_documents({}),
+    }
+
+
+def graph_is_empty() -> bool:
+    return run_cypher("MATCH (c:Candidate) RETURN count(c) AS n")[0]["n"] == 0
+
+
+def seed_all(path: str | None = None) -> dict:
+    p = Path(path) if path else find_dataset()
+    data = transform(read_rows(p))
+    init_neo4j_schema()
+    init_mongo_indexes()
+    load_neo4j(data)
+    load_mongo(data)
+    logger.info("Seed complete from %s", p.name)
+    return {"dataset": p.name, "report": data["report"], "stats": stats(),
+            "note": "Synthetic dataset: candidate/question pairs are semantically matched, not real interviews."}
+```
+
+## Routes
+
+FILE: backend/app/routes/candidates.py
+STATUS: NEW
+```python
+from typing import Optional
+
+from fastapi import APIRouter, Query
+
+from app.schemas.candidate import CandidateCreate, CandidateUpdate
+from app.services import candidate_service
+
+router = APIRouter(prefix="/candidates", tags=["Candidates"])
+
+
+@router.get("")
+def list_candidates(q: Optional[str] = None, domain: Optional[str] = None, job_type: Optional[str] = None):
+    return candidate_service.list_candidates(q=q, domain=domain, job_type=job_type)
+
+
+@router.get("/{candidate_id}")
+def get_candidate(candidate_id: str):
+    return candidate_service.get_candidate(candidate_id)
+
+
+@router.post("", status_code=201)
+def create_candidate(body: CandidateCreate):
+    return candidate_service.create_candidate(body)
+
+
+@router.put("/{candidate_id}")
+def update_candidate(candidate_id: str, body: CandidateUpdate):
+    return candidate_service.update_candidate(candidate_id, body.model_dump(exclude_unset=True))
+
+
+@router.delete("/{candidate_id}")
+def delete_candidate(candidate_id: str):
+    return candidate_service.delete_candidate(candidate_id)
+```
+
+FILE: backend/app/routes/questions.py
+STATUS: NEW
+```python
+from typing import Optional
+
+from fastapi import APIRouter, Query
+
+from app.schemas.question import QuestionCreate, QuestionUpdate
+from app.services import question_service
+
+router = APIRouter(prefix="/questions", tags=["Questions"])
+
+
+@router.get("")
+def list_questions(q: Optional[str] = None, category: Optional[str] = None, difficulty: Optional[str] = None,
+                   role: Optional[str] = None, experience: Optional[str] = None,
+                   page: int = Query(1, ge=1), page_size: int = Query(20, ge=1, le=200)):
+    return question_service.list_questions(q, category, difficulty, role, experience, page, page_size)
+
+
+@router.get("/{question_id}")
+def get_question(question_id: str):
+    return question_service.get_question(question_id)
+
+
+@router.post("", status_code=201)
+def create_question(body: QuestionCreate):
+    return question_service.create_question(body)
+
+
+@router.put("/{question_id}")
+def update_question(question_id: str, body: QuestionUpdate):
+    return question_service.update_question(question_id, body.model_dump(exclude_unset=True))
+
+
+@router.delete("/{question_id}")
+def delete_question(question_id: str):
+    return question_service.delete_question(question_id)
+```
+
+FILE: backend/app/routes/interviews.py
+STATUS: NEW
+```python
+from typing import Optional
+
+from fastapi import APIRouter, Query
+
+from app.schemas.interview import InterviewCreate, InterviewUpdate
+from app.services import interview_service
+
+router = APIRouter(prefix="/interviews", tags=["Interviews"])
+
+
+@router.get("")
+def list_interviews(candidate_id: Optional[str] = None, target_role: Optional[str] = None,
+                    page: int = Query(1, ge=1), page_size: int = Query(20, ge=1, le=100)):
+    return interview_service.list_interviews(candidate_id, target_role, page, page_size)
+
+
+@router.get("/{round_id}")
+def get_interview(round_id: str):
+    return interview_service.get_interview(round_id)
+
+
+@router.post("", status_code=201)
+def create_interview(body: InterviewCreate):
+    return interview_service.create_interview(body)
+
+
+@router.put("/{round_id}")
+def update_interview(round_id: str, body: InterviewUpdate):
+    return interview_service.update_interview(round_id, body)
+
+
+@router.delete("/{round_id}")
+def delete_interview(round_id: str):
+    return interview_service.delete_interview(round_id)
+```
+
+FILE: backend/app/routes/analytics.py
+STATUS: NEW
+```python
+from typing import Optional
+
+from fastapi import APIRouter
+
+from app.services import analytics_service
+
+router = APIRouter(prefix="/analytics", tags=["Analytics"])
+
+
+@router.get("/overview")
+def overview():
+    return analytics_service.overview()
+
+
+@router.get("/skills")
+def skills(skill: Optional[str] = None):
+    return analytics_service.skills_analytics(skill)
+
+
+@router.get("/roles")
+def roles():
+    return analytics_service.roles_analytics()
+
+
+@router.get("/difficulties")
+def difficulties():
+    return analytics_service.difficulties_analytics()
+
+
+@router.get("/gds")
+def gds():
+    return analytics_service.gds_analytics()
+
+
+@router.get("/mongo")
+def mongo():
+    return analytics_service.mongo_aggregations()
+```
+
+FILE: backend/app/routes/graph.py
+STATUS: NEW
+```python
+from typing import Optional
+
+from fastapi import APIRouter
+
+from app.services import graph_service
+
+router = APIRouter(prefix="/graph", tags=["Graph"])
+
+
+@router.get("")
+def full_graph(types: Optional[str] = None):
+    return graph_service.full_graph(types.split(",") if types else None)
+
+
+@router.get("/candidate/{candidate_id}")
+def candidate_graph(candidate_id: str):
+    return graph_service.candidate_graph(candidate_id)
+```
+
+FILE: backend/app/routes/dashboard.py
+STATUS: NEW
+```python
+from fastapi import APIRouter
+
+from app.services import analytics_service
+
+router = APIRouter(prefix="/dashboard", tags=["Dashboard"])
+
+
+@router.get("/summary")
+def summary():
+    return analytics_service.dashboard_summary()
+```
+
+FILE: backend/app/routes/evaluation.py
+STATUS: NEW
+```python
+from fastapi import APIRouter
+
+from app.schemas.evaluation import EvaluationOut
+from app.services import evaluation_service
+
+router = APIRouter(prefix="/evaluation", tags=["Evaluation"])
+
+
+@router.get("/{candidate_id}", response_model=EvaluationOut)
+def evaluate(candidate_id: str):
+    return evaluation_service.evaluate_candidate(candidate_id)
+```
+
+FILE: backend/app/routes/recommendations.py
+STATUS: NEW
+```python
+from fastapi import APIRouter
+
+from app.services import recommendation_service
+
+router = APIRouter(prefix="/recommendations", tags=["Recommendations"])
+
+
+@router.get("/candidate/{candidate_id}")
+def roles(candidate_id: str):
+    return recommendation_service.role_recommendations(candidate_id)
+
+
+@router.get("/similar/{candidate_id}")
+def similar(candidate_id: str):
+    return recommendation_service.similar_candidates(candidate_id)
+
+
+@router.get("/skill-gap/{candidate_id}")
+def skill_gap(candidate_id: str, role_id: str):
+    return recommendation_service.skill_gap(candidate_id, role_id)
+```
+
+FILE: backend/app/routes/catalog.py
+STATUS: NEW
+```python
+from fastapi import APIRouter
+
+from app.services import analytics_service
+
+router = APIRouter(tags=["Catalog"])
+
+
+@router.get("/skills")
+def skills():
+    return analytics_service.catalog_skills()
+
+
+@router.get("/roles")
+def roles():
+    return analytics_service.catalog_roles()
+```
+
+FILE: backend/app/routes/database.py
+STATUS: NEW
+```python
+from fastapi import APIRouter
+
+from app.services import database_service
+
+router = APIRouter(prefix="/database", tags=["Database"])
+
+
+@router.get("/neo4j")
+def neo4j():
+    return database_service.neo4j_info()
+
+
+@router.get("/mongodb")
+def mongodb():
+    return database_service.mongodb_info()
+
+
+@router.get("/indexes")
+def indexes():
+    return database_service.all_indexes()
+```
+
+FILE: backend/app/routes/seed.py
+STATUS: NEW
+```python
+from fastapi import APIRouter, HTTPException
+
+from app.services import seed_service
+
+router = APIRouter(prefix="/seed", tags=["Seed"])
+
+
+@router.post("")
+def seed():
+    try:
+        return seed_service.seed_all()
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+```
+
+FILE: backend/app/main.py
+STATUS: MODIFY
+```python
+"""FastAPI application entry point."""
+
+import logging
+import threading
+import time
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from neo4j.exceptions import ServiceUnavailable
+from pymongo.errors import PyMongoError
+
+from app.config import get_settings
+from app.database.mongodb import close_mongo_client, verify_mongodb_connection
+from app.database.neo4j import close_neo4j_driver, verify_neo4j_connection
+from app.database.schema import init_mongo_indexes, init_neo4j_schema
+from app.routes import analytics, candidates, catalog, dashboard, evaluation, graph, interviews, questions
+from app.routes import database as database_routes
+from app.routes import recommendations, seed
+from app.utils.errors import BadRequestError, ConflictError, NotFoundError
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+logger = logging.getLogger(__name__)
+
+
+def _wait_for_databases(retries: int = 30, delay: float = 2.0) -> tuple[bool, bool]:
+    n = m = False
+    for _ in range(retries):
+        n, m = verify_neo4j_connection(), verify_mongodb_connection()
+        if n and m:
+            break
+        time.sleep(delay)
+    return n, m
+
+
+def _auto_seed() -> None:
+    from app.services import seed_service
+    try:
+        if seed_service.graph_is_empty():
+            logger.info("Graph is empty - seeding from dataset")
+            seed_service.seed_all()
+        else:
+            logger.info("Graph already populated - skipping auto-seed")
+    except Exception as exc:
+        logger.error("Auto-seed failed: %s", exc)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    settings = get_settings()
+    neo4j_ok, mongo_ok = _wait_for_databases()
+    logger.info("Neo4j connected: %s | MongoDB connected: %s", neo4j_ok, mongo_ok)
+    if neo4j_ok:
+        init_neo4j_schema()
+    if mongo_ok:
+        init_mongo_indexes()
+    if settings.auto_seed and neo4j_ok and mongo_ok:
+        threading.Thread(target=_auto_seed, daemon=True).start()
+    yield
+    close_neo4j_driver()
+    close_mongo_client()
+
+
+def create_app() -> FastAPI:
+    settings = get_settings()
+    app = FastAPI(
+        title="Interview Knowledge Graph API",
+        description="Neo4j knowledge graph + MongoDB documents for synthetic interview analysis.",
+        version="1.0.0", lifespan=lifespan, docs_url="/docs", redoc_url="/redoc",
+    )
+    app.add_middleware(CORSMiddleware, allow_origins=settings.cors_origins_list, allow_credentials=True,
+                       allow_methods=["*"], allow_headers=["*"])
+
+    @app.exception_handler(NotFoundError)
+    async def _nf(_: Request, exc: NotFoundError):
+        return JSONResponse(status_code=404, content={"detail": str(exc)})
+
+    @app.exception_handler(ConflictError)
+    async def _cf(_: Request, exc: ConflictError):
+        return JSONResponse(status_code=409, content={"detail": str(exc)})
+
+    @app.exception_handler(BadRequestError)
+    async def _br(_: Request, exc: BadRequestError):
+        return JSONResponse(status_code=400, content={"detail": str(exc)})
+
+    @app.exception_handler(ServiceUnavailable)
+    async def _neo(_: Request, exc: ServiceUnavailable):
+        return JSONResponse(status_code=503, content={"detail": "Neo4j is unavailable"})
+
+    @app.exception_handler(PyMongoError)
+    async def _mongo(_: Request, exc: PyMongoError):
+        return JSONResponse(status_code=503, content={"detail": "MongoDB is unavailable"})
+
+    @app.get("/health")
+    def health_check():
+        return {"status": "ok", "neo4j": verify_neo4j_connection(), "mongodb": verify_mongodb_connection()}
+
+    @app.get("/")
+    def root():
+        return {"message": "Interview Knowledge Graph API", "docs": "/docs", "health": "/health",
+                "api_prefix": settings.api_prefix}
+
+    for module in (dashboard, candidates, questions, interviews, evaluation, graph, analytics,
+                   recommendations, database_routes, seed, catalog):
+        app.include_router(module.router, prefix=settings.api_prefix)
+    return app
+
+
+app = create_app()
+```
+
+FILE: backend/seed_database.py
+STATUS: MODIFY
+```python
+#!/usr/bin/env python3
+"""Seed Neo4j + MongoDB from data/synthetic_interview_dataset.csv (idempotent).
+
+Usage (inside the backend container):  python seed_database.py [path/to/csv]
+"""
+
+import json
+import logging
+import sys
+
+logging.basicConfig(level=logging.INFO)
+
+
+def main() -> int:
+    from app.services import seed_service
+    path = sys.argv[1] if len(sys.argv) > 1 else None
+    try:
+        result = seed_service.seed_all(path)
+    except Exception as exc:
+        print(f"SEED FAILED: {exc}")
+        return 1
+    print(json.dumps(result, indent=2, default=str))
+    if result["report"]["missing_columns"]:
+        print("\nWARNING: dataset is missing expected columns:", result["report"]["missing_columns"])
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+```
+
+FILE: backend/validate_system.py
+STATUS: NEW
+```python
+#!/usr/bin/env python3
+"""End-to-end validation against a running backend. Usage: python validate_system.py [base_url]"""
+
+import json
+import sys
+import urllib.request
+
+BASE = (sys.argv[1] if len(sys.argv) > 1 else "http://localhost:8000").rstrip("/")
+
+
+def get(path: str):
+    with urllib.request.urlopen(BASE + path, timeout=60) as r:
+        return json.loads(r.read())
+
+
+def main() -> int:
+    failures = 0
+
+    def check(name, fn):
+        nonlocal failures
+        try:
+            ok, detail = fn()
+        except Exception as exc:
+            ok, detail = False, str(exc)[:150]
+        failures += 0 if ok else 1
+        print(f"[{'PASS' if ok else 'FAIL'}] {name} {detail}")
+
+    check("health", lambda: ((h := get("/health"))["neo4j"] and h["mongodb"], str(get("/health"))))
+    summary = get("/api/dashboard/summary")
+    c = summary["counts"]
+    check("dashboard counts > 0", lambda: (all(c[k] > 0 for k in ("candidates", "questions", "answers", "skills", "roles", "interviews", "emotion_logs")), str(c)))
+    cands = get("/api/candidates")["items"]
+    cid = cands[0]["candidate_id"]
+    qs = get("/api/questions?page_size=5")
+    for name, path in [
+        ("candidate profile", f"/api/candidates/{cid}"), ("evaluation", f"/api/evaluation/{cid}"),
+        ("recommendations", f"/api/recommendations/candidate/{cid}"), ("similar", f"/api/recommendations/similar/{cid}"),
+        ("question detail", f"/api/questions/{qs['items'][0]['question_id']}"),
+        ("interviews", "/api/interviews"), ("graph", "/api/graph"), ("graph candidate", f"/api/graph/candidate/{cid}"),
+        ("analytics overview", "/api/analytics/overview"), ("analytics skills", "/api/analytics/skills"),
+        ("analytics roles", "/api/analytics/roles"), ("analytics difficulties", "/api/analytics/difficulties"),
+        ("analytics gds", "/api/analytics/gds"), ("analytics mongo", "/api/analytics/mongo"),
+        ("db neo4j", "/api/database/neo4j"), ("db mongodb", "/api/database/mongodb"),
+        ("db indexes", "/api/database/indexes"), ("skills", "/api/skills"), ("roles", "/api/roles"),
+    ]:
+        check(name, lambda p=path: (bool(get(p)), ""))
+    g = get("/api/graph")
+    check("graph has nodes and links", lambda: (g["stats"]["nodes"] > 0 and g["stats"]["links"] > 0, str(g["stats"])))
+    print(f"\n{failures} failure(s)")
+    return 1 if failures else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+```
+
+## Tests
+
+FILE: backend/tests/test_api.py
+STATUS: NEW
+```python
+from fastapi.testclient import TestClient
+
+import app.main as main
+from app.services import candidate_service, question_service
+
+client = TestClient(main.app)
+
+
+def test_health(monkeypatch):
+    monkeypatch.setattr(main, "verify_neo4j_connection", lambda: True)
+    monkeypatch.setattr(main, "verify_mongodb_connection", lambda: False)
+    r = client.get("/health")
+    assert r.status_code == 200
+    assert r.json() == {"status": "ok", "neo4j": True, "mongodb": False}
+
+
+def test_candidate_endpoint(monkeypatch):
+    fake = {"items": [{"candidate_id": "C1", "name": "Candidate C1"}], "total": 1, "facets": {}}
+    monkeypatch.setattr(candidate_service, "list_candidates", lambda **kw: fake)
+    r = client.get("/api/candidates?q=c1")
+    assert r.status_code == 200 and r.json()["total"] == 1
+
+
+def test_candidate_not_found(monkeypatch):
+    from app.utils.errors import NotFoundError
+
+    def boom(cid):
+        raise NotFoundError("missing")
+    monkeypatch.setattr(candidate_service, "get_candidate", boom)
+    assert client.get("/api/candidates/NOPE").status_code == 404
+
+
+def test_question_endpoint(monkeypatch):
+    monkeypatch.setattr(question_service, "list_questions", lambda *a, **k: {"items": [], "total": 0, "page": 1, "page_size": 20, "facets": {}})
+    r = client.get("/api/questions?page=1&page_size=20")
+    assert r.status_code == 200 and r.json()["total"] == 0
+```
+
+FILE: backend/tests/test_evaluation.py
+STATUS: NEW
+```python
+from app.services.evaluation_service import compute_evaluation
+
+
+def test_evaluation_is_deterministic_and_bounded():
+    answers = [
+        {"score": 8, "difficulty": "Hard", "category": "Technical", "word_count": 90, "skills": ["Python"]},
+        {"score": 4, "difficulty": "Easy", "category": "Behavioral", "word_count": 30, "skills": []},
+    ]
+    a = compute_evaluation(answers, 60.0, ["Python"], ["Docker"], "Data Scientist")
+    b = compute_evaluation(answers, 60.0, ["Python"], ["Docker"], "Data Scientist")
+    assert a == b
+    for key in ("overall_score", "technical_score", "communication_score"):
+        assert 0 <= a[key] <= 10
+    assert a["skill_coverage"] == 60.0
+    assert any("Docker" in w for w in a["weaknesses"])
+    assert len(a["explanation"]) >= 4
+
+
+def test_empty_answers_do_not_crash():
+    r = compute_evaluation([], 0.0, [], [])
+    assert r["overall_score"] == 0.0
+```
+
+FILE: backend/tests/test_seed_transform.py
+STATUS: NEW
+```python
+from app.seed.loader import transform
+
+ROWS = [
+    {"candidate_id": "C1", "candidate_domain": "Data", "education": "B.Tech", "skills": "Python, SQL, Docker",
+     "candidate_experience": "2 years", "job_type": "Full-time", "round_id": "R1", "question_id": "Q1",
+     "question": "Explain Python decorators", "question_category": "Technical", "target_role": "Data Scientist",
+     "difficulty": "Easy", "question_experience": "Fresher", "answer_id": "A1",
+     "answer": "Python decorators wrap functions to add behaviour.", "keywords": "decorator, Python"},
+    {"candidate_id": "C1", "candidate_domain": "Data", "education": "B.Tech", "skills": "Python, SQL, Docker",
+     "candidate_experience": "2 years", "job_type": "Full-time", "round_id": "R1", "question_id": "Q2",
+     "question": "What is a SQL join?", "question_category": "Technical", "target_role": "Data Scientist",
+     "difficulty": "Medium", "question_experience": "Fresher", "answer_id": "A2",
+     "answer": "A join combines rows from tables in SQL.", "keywords": "join, SQL"},
+    {"candidate_id": "C2", "candidate_domain": "Web", "education": "B.E", "skills": "Python; React",
+     "candidate_experience": "1 year", "job_type": "Intern", "round_id": "R1", "question_id": "Q3",
+     "question": "Tell me about a conflict", "question_category": "Behavioral", "target_role": "Backend Developer",
+     "difficulty": "Easy", "question_experience": "Fresher", "answer_id": "A3", "answer": "I resolved it calmly.",
+     "keywords": ""},
+]
+
+
+def test_counts_are_derived_from_data():
+    d = transform(ROWS)
+    r = d["report"]
+    assert (r["candidates"], r["questions"], r["answers"], r["roles"]) == (2, 3, 3, 2)
+    assert r["emotion_logs"] == 9  # 3 samples per answer
+    assert r["interviews"] == 2
+
+
+def test_ids_are_stable_for_idempotent_merge():
+    a, b = transform(ROWS), transform(ROWS)
+    assert [x["answer_id"] for x in a["answers"]] == [x["answer_id"] for x in b["answers"]]
+    assert [x["_id"] for x in a["emotion_logs"]] == [x["_id"] for x in b["emotion_logs"]]
+    assert a["answers"] == b["answers"]
+
+
+def test_relationships_are_derived_not_invented():
+    d = transform(ROWS)
+    assert {"candidate_id": "C1", "skill_id": "SK-python"} in d["candidate_skills"]
+    assert {"question_id": "Q2", "skill_id": "SK-sql"} in d["question_skills"]
+    assert d["companies"] == []  # no company column -> no company nodes
+    assert all(0 < x["score"] <= 10 for x in d["answers"])
+```
+
+---
+
+# DATABASE FILES
+
+FILE: database/mongodb/seed.js
+STATUS: MODIFY
+```javascript
+// MongoDB initialisation (runs once on a fresh volume via docker-entrypoint-initdb.d).
+// Data itself is loaded by the backend seed (POST /api/seed or python seed_database.py).
+db = db.getSiblingDB('interview_db');
+
+db.createCollection('raw_interviews');
+db.createCollection('emotion_logs');
+
+['candidate_id', 'round_id', 'target_role', 'started_at'].forEach(f => db.raw_interviews.createIndex({ [f]: 1 }));
+['candidate_id', 'interview_id', 'label', 'timestamp', 'confidence'].forEach(f => db.emotion_logs.createIndex({ [f]: 1 }));
+
+print('MongoDB collections and indexes initialised for interview_db');
+```
+
+FILE: database/neo4j/queries.cypher
+STATUS: NEW
+```cypher
+// =============================================================================
+// Neo4j query pack (run in Neo4j Browser, http://localhost:7474). Each is a DA2 screenshot candidate.
+// =============================================================================
+
+// Q1 Graph overview: candidates, rounds and questions
+MATCH (c:Candidate)-[:PARTICIPATES_IN]->(r:InterviewRound)-[:INCLUDES]->(q:Question)
+RETURN c, r, q LIMIT 40;
+
+// Q2 Node counts by label
+MATCH (n) RETURN labels(n)[0] AS label, count(*) AS nodes ORDER BY nodes DESC;
+
+// Q3 Relationship counts by type
+MATCH ()-[r]->() RETURN type(r) AS relationship, count(*) AS total ORDER BY total DESC;
+
+// Q4 Strongest candidates for a skill (change the skill name)
+MATCH (c:Candidate)-[:ANSWERED]->(a:Answer)-[:DEMONSTRATES]->(s:Skill)
+WHERE toLower(s.name) = toLower('Python')
+WITH c, avg(a.score) AS avg_score, count(a) AS evidence
+RETURN c.candidate_id, c.name, round(avg_score, 2) AS avg_score, evidence
+ORDER BY avg_score DESC, evidence DESC LIMIT 10;
+
+// Q5 Most difficult questions (lowest average answer score)
+MATCH (a:Answer)-[:IN_RESPONSE_TO]->(q:Question)
+WITH q, avg(a.score) AS avg_score, count(a) AS answers
+RETURN q.question_id, q.difficulty, left(q.text, 80) AS question, round(avg_score, 2) AS avg_score
+ORDER BY avg_score ASC LIMIT 10;
+
+// Q6 Skill co-occurrence (skills tested together by the same question)
+MATCH (q:Question)-[:TESTS_SKILL]->(a:Skill), (q)-[:TESTS_SKILL]->(b:Skill)
+WHERE a.skill_id < b.skill_id
+RETURN a.name AS skill_a, b.name AS skill_b, count(DISTINCT q) AS together
+ORDER BY together DESC LIMIT 15;
+
+// Q7 Skills required for each role (weighted)
+MATCH (s:Skill)-[rel:REQUIRED_FOR]->(r:Role)
+WITH r, s, rel ORDER BY rel.weight DESC
+RETURN r.title AS role, collect(s.name + ' (' + rel.weight + ')') AS required_skills
+ORDER BY role;
+
+// Q8 Skill gap for the first candidate against their interviewed role(s)
+MATCH (c:Candidate) WITH c ORDER BY c.candidate_id LIMIT 1
+MATCH (c)-[:INTERVIEWED_FOR]->(r:Role)
+MATCH (s:Skill)-[:REQUIRED_FOR]->(r)
+WITH c, r, collect(DISTINCT s) AS required
+WITH c, r, required, [s IN required WHERE (c)-[:HAS_SKILL]->(s) | s.name] AS matched,
+     [s IN required WHERE NOT (c)-[:HAS_SKILL]->(s) | s.name] AS missing
+RETURN c.candidate_id, r.title AS role, matched, missing,
+       round(100.0 * size(matched) / size(required), 1) AS coverage_pct;
+
+// Q9 Important skills (most connected: candidates + questions + roles)
+MATCH (s:Skill)
+OPTIONAL MATCH (c:Candidate)-[:HAS_SKILL]->(s)
+WITH s, count(DISTINCT c) AS candidates
+OPTIONAL MATCH (q:Question)-[:TESTS_SKILL]->(s)
+WITH s, candidates, count(DISTINCT q) AS questions
+OPTIONAL MATCH (s)-[:REQUIRED_FOR]->(r:Role)
+RETURN s.name, candidates, questions, count(DISTINCT r) AS roles,
+       candidates + questions + count(DISTINCT r) AS importance
+ORDER BY importance DESC LIMIT 10;
+
+// Q10 Candidate similarity by shared skills (Jaccard)
+MATCH (a:Candidate)-[:HAS_SKILL]->(s:Skill)<-[:HAS_SKILL]-(b:Candidate)
+WHERE a.candidate_id < b.candidate_id
+WITH a, b, collect(s.name) AS shared, count(s) AS inter
+OPTIONAL MATCH (a)-[:HAS_SKILL]->(sa:Skill) WITH a, b, shared, inter, count(sa) AS na
+OPTIONAL MATCH (b)-[:HAS_SKILL]->(sb:Skill)
+WITH a, b, shared, inter, na, count(sb) AS nb
+RETURN a.candidate_id, b.candidate_id, shared, round(100.0 * inter / (na + nb - inter), 1) AS similarity_pct
+ORDER BY similarity_pct DESC LIMIT 10;
+
+// Q11 Role-skill analysis (required skills, questions, mean score)
+MATCH (r:Role)
+OPTIONAL MATCH (s:Skill)-[:REQUIRED_FOR]->(r)
+WITH r, count(DISTINCT s) AS required_skills
+OPTIONAL MATCH (a:Answer)-[:IN_RESPONSE_TO]->(:Question)-[:FOR_ROLE]->(r)
+RETURN r.title, required_skills, count(a) AS answers, round(avg(a.score), 2) AS avg_score ORDER BY avg_score DESC;
+
+// Q12 Company-question analysis (returns rows only if the dataset has a company column)
+MATCH (c:Candidate)-[:APPLIED_TO]->(co:Company)
+MATCH (c)-[:ANSWERED]->(:Answer)-[:IN_RESPONSE_TO]->(q:Question)
+RETURN co.name, q.category, count(*) AS asked ORDER BY asked DESC LIMIT 20;
+
+// Q13 Full candidate evaluation inputs (first candidate)
+MATCH (c:Candidate) WITH c ORDER BY c.candidate_id LIMIT 1
+MATCH (c)-[:ANSWERED]->(a:Answer)-[:IN_RESPONSE_TO]->(q:Question)
+OPTIONAL MATCH (a)-[:DEMONSTRATES]->(s:Skill)
+RETURN c.name, q.category, q.difficulty, a.score, collect(DISTINCT s.name) AS skills ORDER BY q.difficulty;
+
+// Q14 Interview performance per round
+MATCH (c:Candidate)-[:PARTICIPATES_IN]->(r:InterviewRound)
+MATCH (a:Answer {round_id: r.round_id})
+RETURN c.candidate_id, r.round_label, r.date, count(a) AS answers, round(avg(a.score), 2) AS avg_score
+ORDER BY avg_score DESC LIMIT 15;
+
+// Q15 Skill coverage per candidate for the interviewed role
+MATCH (c:Candidate)-[:INTERVIEWED_FOR]->(r:Role)<-[:REQUIRED_FOR]-(s:Skill)
+WITH c, r, collect(s) AS required
+WITH c, r, size(required) AS total, size([s IN required WHERE (c)-[:HAS_SKILL]->(s)]) AS matched
+RETURN c.candidate_id, r.title, matched, total, round(100.0 * matched / total, 1) AS coverage_pct
+ORDER BY coverage_pct DESC LIMIT 15;
+
+// Q16 Emotion vs score
+MATCH (c:Candidate)-[:EXPRESSED]->(e:Emotion)
+MATCH (a:Answer {answer_id: e.answer_id})
+RETURN e.label, count(*) AS answers, round(avg(a.score), 2) AS avg_score, round(avg(e.confidence), 2) AS avg_confidence
+ORDER BY avg_score DESC;
+
+// Q17 UNWIND the skills property of every candidate and count holders
+MATCH (c:Candidate) UNWIND c.skills AS skill
+RETURN skill, count(*) AS holders ORDER BY holders DESC LIMIT 15;
+
+// ------------------------------- GDS (Graph Data Science) ---------------------
+// Q18 PageRank of skills
+CALL gds.graph.project('qRank', ['Skill','Question','Candidate'],
+  {TESTS_SKILL:{orientation:'NATURAL'}, HAS_SKILL:{orientation:'NATURAL'}});
+CALL gds.pageRank.stream('qRank') YIELD nodeId, score
+WITH gds.util.asNode(nodeId) AS n, score WHERE n:Skill
+RETURN n.name AS skill, round(score, 4) AS pagerank ORDER BY pagerank DESC LIMIT 10;
+CALL gds.graph.drop('qRank');
+
+// Q19 Louvain communities of skills
+CALL gds.graph.project('qComm', ['Skill','Question'], {TESTS_SKILL:{orientation:'UNDIRECTED'}});
+CALL gds.louvain.stream('qComm') YIELD nodeId, communityId
+WITH gds.util.asNode(nodeId) AS n, communityId WHERE n:Skill
+RETURN communityId, collect(n.name) AS skills ORDER BY size(skills) DESC;
+CALL gds.graph.drop('qComm');
+
+// Q20 Node Similarity between candidates
+CALL gds.graph.project('qSim', ['Candidate','Skill'], {HAS_SKILL:{orientation:'NATURAL'}});
+CALL gds.nodeSimilarity.stream('qSim') YIELD node1, node2, similarity
+WITH gds.util.asNode(node1) AS a, gds.util.asNode(node2) AS b, similarity WHERE a.candidate_id < b.candidate_id
+RETURN a.candidate_id, b.candidate_id, round(similarity, 3) AS similarity ORDER BY similarity DESC LIMIT 10;
+CALL gds.graph.drop('qSim');
+```
+
+FILE: database/mongodb/queries.js
+STATUS: NEW
+```javascript
+// MongoDB query pack. Run with:
+//   docker compose exec mongodb mongosh interview_db --file /docker-entrypoint-initdb.d/queries.js
+// or paste into mongosh one at a time (each is a DA2 screenshot candidate).
+db = db.getSiblingDB('interview_db');
+
+// M1 find + projection + sort + limit: latest interviews
+printjson(db.raw_interviews.find({}, { candidate_id: 1, round_label: 1, target_role: 1, started_at: 1 })
+  .sort({ started_at: -1 }).limit(5).toArray());
+
+// M2 filter by role with projection
+printjson(db.raw_interviews.find({ target_role: { $exists: true } }, { target_role: 1, candidate_id: 1 }).limit(5).toArray());
+
+// M3 embedded array query: interviews containing a Hard question
+printjson(db.raw_interviews.find({ 'qa.difficulty': 'Hard' }, { candidate_id: 1, 'qa.$': 1 }).limit(3).toArray());
+
+// M4 emotion distribution
+printjson(db.emotion_logs.aggregate([
+  { $group: { _id: '$label', count: { $sum: 1 }, avg_confidence: { $avg: '$confidence' } } },
+  { $sort: { count: -1 } }]).toArray());
+
+// M5 average emotion confidence
+printjson(db.emotion_logs.aggregate([{ $group: { _id: null, avg_confidence: { $avg: '$confidence' }, samples: { $sum: 1 } } }]).toArray());
+
+// M6 interviews per role
+printjson(db.raw_interviews.aggregate([{ $group: { _id: '$target_role', interviews: { $sum: 1 } } }, { $sort: { interviews: -1 } }]).toArray());
+
+// M7 average answer score ($unwind on embedded qa)
+printjson(db.raw_interviews.aggregate([{ $unwind: '$qa' }, { $group: { _id: null, avg_score: { $avg: '$qa.score' }, answers: { $sum: 1 } } }]).toArray());
+
+// M8 candidate interview statistics
+printjson(db.raw_interviews.aggregate([
+  { $unwind: '$qa' },
+  { $group: { _id: '$candidate_id', interviews: { $addToSet: '$_id' }, answers: { $sum: 1 }, avg_score: { $avg: '$qa.score' } } },
+  { $project: { interviews: { $size: '$interviews' }, answers: 1, avg_score: { $round: ['$avg_score', 2] } } },
+  { $sort: { avg_score: -1 } }, { $limit: 10 }]).toArray());
+
+// M9 emotion trend across the interview phases
+printjson(db.emotion_logs.aggregate([
+  { $group: { _id: { phase: '$phase', label: '$label' }, count: { $sum: 1 } } },
+  { $sort: { '_id.phase': 1, count: -1 } }]).toArray());
+
+// M10 UPDATE: annotate an interview, then DELETE a low-confidence emotion log (demo on one doc)
+var one = db.raw_interviews.findOne({}, { _id: 1 });
+printjson(db.raw_interviews.updateOne({ _id: one._id }, { $set: { 'metadata.reviewed': true } }));
+printjson(db.emotion_logs.deleteMany({ confidence: { $lt: 0.0 } }));   // safe no-op demo
+
+// M11 index inspection + explain (shows IXSCAN)
+printjson(db.raw_interviews.getIndexes());
+printjson(db.emotion_logs.find({ candidate_id: one.candidate_id }).explain('executionStats').queryPlanner.winningPlan);
+```
+
+---
+
+# DOCKER AND ENVIRONMENT
+
+FILE: docker-compose.yml
+STATUS: MODIFY
+```yaml
+services:
+  neo4j:
+    image: neo4j:5.15.0-enterprise
+    container_name: ikg-neo4j
+    restart: unless-stopped
+    environment:
+      - NEO4J_AUTH=${NEO4J_AUTH:-neo4j/interview_graph_password}
+      - NEO4J_ACCEPT_LICENSE_AGREEMENT=yes
+      - NEO4J_PLUGINS=["graph-data-science"]
+      - NEO4J_dbms_security_procedures_unrestricted=gds.*
+      - NEO4J_dbms_security_procedures_allowlist=gds.*
+    ports:
+      - "7474:7474"
+      - "7687:7687"
+    volumes:
+      - neo4j_data:/data
+      - neo4j_logs:/logs
+      - ./database/neo4j:/import/cypher
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:7474 || exit 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 15
+      start_period: 40s
+    networks:
+      - ikg-network
+
+  mongodb:
+    image: mongo:7.0
+    container_name: ikg-mongodb
+    restart: unless-stopped
+    environment:
+      - MONGO_INITDB_DATABASE=${MONGO_INITDB_DATABASE:-interview_db}
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongodb_data:/data/db
+      - ./database/mongodb:/docker-entrypoint-initdb.d
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 20s
+    networks:
+      - ikg-network
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: ikg-backend
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - NEO4J_URI=bolt://neo4j:7687
+      - MONGODB_URI=mongodb://mongodb:27017
+      - CORS_ORIGINS=http://localhost:3000,http://localhost:5173,http://frontend:5173
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./backend:/app
+      - ./data:/app/data
+      - ./sample_data:/app/sample_data
+      - ./database:/app/database
+    depends_on:
+      neo4j:
+        condition: service_healthy
+      mongodb:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health')\""]
+      interval: 15s
+      timeout: 10s
+      retries: 15
+      start_period: 60s
+    networks:
+      - ikg-network
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: ikg-frontend
+    restart: unless-stopped
+    environment:
+      - VITE_API_BASE_URL=http://localhost:8000/api
+    ports:
+      - "5173:5173"
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    depends_on:
+      backend:
+        condition: service_healthy
+    networks:
+      - ikg-network
+
+volumes:
+  neo4j_data:
+  neo4j_logs:
+  mongodb_data:
+
+networks:
+  ikg-network:
+    driver: bridge
+```
+
+FILE: .env.example
+STATUS: MODIFY
+```bash
+# Interview Knowledge Graph - copy to .env
+
+# Neo4j (inside Docker the host is "neo4j"; outside Docker use bolt://localhost:7687)
+NEO4J_URI=bolt://neo4j:7687
+NEO4J_USER=neo4j
+NEO4J_PASSWORD=interview_graph_password
+NEO4J_DATABASE=neo4j
+
+# MongoDB (outside Docker use mongodb://localhost:27017)
+MONGODB_URI=mongodb://mongodb:27017
+MONGODB_DATABASE=interview_db
+
+# FastAPI
+BACKEND_HOST=0.0.0.0
+BACKEND_PORT=8000
+API_PREFIX=/api
+CORS_ORIGINS=http://localhost:3000,http://localhost:5173,http://frontend:5173
+
+# Seed the databases on startup when the graph is empty (true/false)
+AUTO_SEED=true
+# Optional explicit dataset path (default: <project>/data/synthetic_interview_dataset.csv)
+DATASET_PATH=
+
+# Frontend
+VITE_API_BASE_URL=http://localhost:8000/api
+
+# Optional (evaluation is deterministic and needs none of these)
+LLM_PROVIDER=mock
+
+# Docker Compose
+NEO4J_AUTH=neo4j/interview_graph_password
+MONGO_INITDB_DATABASE=interview_db
+```
+
+---
+
+# FRONTEND
+
+FILE: frontend/src/index.css
+STATUS: MODIFY
+```css
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+body {
+  margin: 0;
+  font-family: Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+@layer components {
+  .card { @apply bg-white rounded-xl border border-slate-200 shadow-sm; }
+  .btn { @apply inline-flex items-center justify-center gap-2 rounded-lg px-3 py-2 text-sm font-medium transition disabled:opacity-50; }
+  .btn-primary { @apply btn bg-indigo-600 text-white hover:bg-indigo-700; }
+  .btn-ghost { @apply btn border border-slate-200 bg-white text-slate-700 hover:bg-slate-50; }
+  .btn-danger { @apply btn bg-rose-600 text-white hover:bg-rose-700; }
+  .input { @apply w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm focus:border-indigo-500 focus:outline-none focus:ring-2 focus:ring-indigo-200; }
+  .th { @apply px-4 py-3 text-left text-xs font-semibold uppercase tracking-wide text-slate-500; }
+  .td { @apply px-4 py-3 text-sm text-slate-700; }
+}
+```
+
+FILE: frontend/src/services/api.js
+STATUS: MODIFY
+```javascript
+import axios from 'axios';
+
+const API_BASE = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000/api';
+const http = axios.create({ baseURL: API_BASE, timeout: 60000 });
+
+const clean = (p = {}) => Object.fromEntries(Object.entries(p).filter(([, v]) => v !== '' && v != null));
+const get = (url, params) => http.get(url, { params: clean(params) }).then((r) => r.data);
+const post = (url, body) => http.post(url, body).then((r) => r.data);
+const put = (url, body) => http.put(url, body).then((r) => r.data);
+const del = (url) => http.delete(url).then((r) => r.data);
+const enc = encodeURIComponent;
+
+export const errMsg = (e) => {
+  const d = e?.response?.data?.detail;
+  if (Array.isArray(d)) return d.map((x) => `${x.loc?.slice(-1)[0]}: ${x.msg}`).join('; ');
+  return d || e?.message || 'Request failed';
+};
+
+export const api = {
+  health: () => axios.get(API_BASE.replace(/\/api\/?$/, '') + '/health').then((r) => r.data),
+  seed: () => post('/seed'),
+  dashboard: () => get('/dashboard/summary'),
+
+  candidates: (p) => get('/candidates', p),
+  candidate: (id) => get(`/candidates/${enc(id)}`),
+  createCandidate: (b) => post('/candidates', b),
+  updateCandidate: (id, b) => put(`/candidates/${enc(id)}`, b),
+  deleteCandidate: (id) => del(`/candidates/${enc(id)}`),
+
+  questions: (p) => get('/questions', p),
+  question: (id) => get(`/questions/${enc(id)}`),
+  createQuestion: (b) => post('/questions', b),
+  updateQuestion: (id, b) => put(`/questions/${enc(id)}`, b),
+  deleteQuestion: (id) => del(`/questions/${enc(id)}`),
+
+  interviews: (p) => get('/interviews', p),
+  interview: (id) => get(`/interviews/${enc(id)}`),
+  createInterview: (b) => post('/interviews', b),
+  updateInterview: (id, b) => put(`/interviews/${enc(id)}`, b),
+  deleteInterview: (id) => del(`/interviews/${enc(id)}`),
+
+  evaluation: (id) => get(`/evaluation/${enc(id)}`),
+  graph: (p) => get('/graph', p),
+  candidateGraph: (id) => get(`/graph/candidate/${enc(id)}`),
+
+  analyticsOverview: () => get('/analytics/overview'),
+  analyticsSkills: (p) => get('/analytics/skills', p),
+  analyticsRoles: () => get('/analytics/roles'),
+  analyticsDifficulties: () => get('/analytics/difficulties'),
+  analyticsGds: () => get('/analytics/gds'),
+  analyticsMongo: () => get('/analytics/mongo'),
+
+  roleRecs: (id) => get(`/recommendations/candidate/${enc(id)}`),
+  similar: (id) => get(`/recommendations/similar/${enc(id)}`),
+  skillGap: (id, roleId) => get(`/recommendations/skill-gap/${enc(id)}`, { role_id: roleId }),
+
+  skills: () => get('/skills'),
+  roles: () => get('/roles'),
+
+  dbNeo4j: () => get('/database/neo4j'),
+  dbMongo: () => get('/database/mongodb'),
+  dbIndexes: () => get('/database/indexes'),
+};
+```
+
+FILE: frontend/src/hooks/useApi.js
+STATUS: NEW
+```javascript
+import { useCallback, useEffect, useState } from 'react';
+import { errMsg } from '../services/api';
+
+export function useApi(fetcher, deps = []) {
+  const [data, setData] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(null);
+  const [tick, setTick] = useState(0);
+
+  useEffect(() => {
+    let alive = true;
+    setLoading(true);
+    setError(null);
+    Promise.resolve()
+      .then(fetcher)
+      .then((d) => alive && setData(d))
+      .catch((e) => alive && setError(errMsg(e)))
+      .finally(() => alive && setLoading(false));
+    return () => {
+      alive = false;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [...deps, tick]);
+
+  const reload = useCallback(() => setTick((t) => t + 1), []);
+  return { data, loading, error, reload };
+}
+```
+
+FILE: frontend/src/components/ui.jsx
+STATUS: NEW
+```jsx
+import { AlertTriangle, Inbox, Loader2, X } from 'lucide-react';
+import {
+  Bar, BarChart, CartesianGrid, Cell, Pie, PieChart, ResponsiveContainer, Tooltip, XAxis, YAxis, Legend,
+} from 'recharts';
+
+export const COLORS = ['#6366f1', '#10b981', '#f59e0b', '#ef4444', '#06b6d4', '#8b5cf6', '#ec4899', '#84cc16', '#14b8a6', '#f97316'];
+
+export function PageHeader({ title, subtitle, actions }) {
+  return (
+    <div className="mb-6 flex flex-wrap items-end justify-between gap-3">
+      <div>
+        <h1 className="text-2xl font-bold text-slate-900">{title}</h1>
+        {subtitle && <p className="mt-1 max-w-3xl text-sm text-slate-500">{subtitle}</p>}
+      </div>
+      <div className="flex flex-wrap gap-2">{actions}</div>
+    </div>
+  );
+}
+
+export function StatCard({ label, value, icon: Icon, tone = 'indigo' }) {
+  const tones = { indigo: 'bg-indigo-50 text-indigo-600', emerald: 'bg-emerald-50 text-emerald-600', amber: 'bg-amber-50 text-amber-600', rose: 'bg-rose-50 text-rose-600', cyan: 'bg-cyan-50 text-cyan-600' };
+  return (
+    <div className="card flex items-center gap-4 p-4">
+      {Icon && <div className={`rounded-lg p-3 ${tones[tone] || tones.indigo}`}><Icon size={20} /></div>}
+      <div>
+        <div className="text-2xl font-bold text-slate-900">{value ?? '—'}</div>
+        <div className="text-xs font-medium uppercase tracking-wide text-slate-500">{label}</div>
+      </div>
+    </div>
+  );
+}
+
+export function Loading({ text = 'Loading…' }) {
+  return (
+    <div className="flex items-center justify-center gap-2 py-16 text-slate-500">
+      <Loader2 className="animate-spin" size={18} /> {text}
+    </div>
+  );
+}
+
+export function ErrorState({ message, onRetry }) {
+  return (
+    <div className="card flex flex-col items-center gap-3 border-rose-200 bg-rose-50 p-8 text-center">
+      <AlertTriangle className="text-rose-500" />
+      <p className="text-sm text-rose-700">{message}</p>
+      {onRetry && <button className="btn-ghost" onClick={onRetry}>Retry</button>}
+    </div>
+  );
+}
+
+export function EmptyState({ text = 'No data available' }) {
+  return (
+    <div className="flex flex-col items-center gap-2 py-10 text-slate-400">
+      <Inbox /> <span className="text-sm">{text}</span>
+    </div>
+  );
+}
+
+export function Async({ state, children }) {
+  if (state.loading && !state.data) return <Loading />;
+  if (state.error) return <ErrorState message={state.error} onRetry={state.reload} />;
+  if (!state.data) return <EmptyState />;
+  return children(state.data);
+}
+
+export function Badge({ children, tone = 'slate' }) {
+  const tones = {
+    slate: 'bg-slate-100 text-slate-700', indigo: 'bg-indigo-100 text-indigo-700', emerald: 'bg-emerald-100 text-emerald-700',
+    amber: 'bg-amber-100 text-amber-700', rose: 'bg-rose-100 text-rose-700', cyan: 'bg-cyan-100 text-cyan-700',
+  };
+  return <span className={`inline-block rounded-full px-2.5 py-0.5 text-xs font-medium ${tones[tone] || tones.slate}`}>{children}</span>;
+}
+
+export const SkillBadge = ({ name, tone = 'indigo' }) => <Badge tone={tone}>{name}</Badge>;
+
+export const diffTone = (d) => ({ easy: 'emerald', medium: 'amber', hard: 'rose' }[(d || '').toLowerCase()] || 'slate');
+
+export function ChartCard({ title, subtitle, children }) {
+  return (
+    <div className="card p-4">
+      <div className="mb-3">
+        <h3 className="font-semibold text-slate-800">{title}</h3>
+        {subtitle && <p className="text-xs text-slate-500">{subtitle}</p>}
+      </div>
+      {children}
+    </div>
+  );
+}
+
+export function ScoreBar({ value, max = 100, tone = 'indigo' }) {
+  const pct = Math.max(0, Math.min(100, ((value ?? 0) / max) * 100));
+  const colors = { indigo: 'bg-indigo-500', emerald: 'bg-emerald-500', amber: 'bg-amber-500' };
+  return (
+    <div className="h-2 w-full rounded-full bg-slate-100">
+      <div className={`h-2 rounded-full ${colors[tone] || colors.indigo}`} style={{ width: `${pct}%` }} />
+    </div>
+  );
+}
+
+export function Modal({ title, onClose, children, wide }) {
+  return (
+    <div className="fixed inset-0 z-50 flex items-start justify-center overflow-y-auto bg-slate-900/50 p-4" onClick={onClose}>
+      <div className={`card my-8 w-full ${wide ? 'max-w-4xl' : 'max-w-xl'}`} onClick={(e) => e.stopPropagation()}>
+        <div className="flex items-center justify-between border-b border-slate-200 px-5 py-3">
+          <h3 className="font-semibold text-slate-900">{title}</h3>
+          <button onClick={onClose} className="text-slate-400 hover:text-slate-700"><X size={18} /></button>
+        </div>
+        <div className="p-5">{children}</div>
+      </div>
+    </div>
+  );
+}
+
+export const Field = ({ label, children }) => (
+  <label className="mb-3 block text-sm">
+    <span className="mb-1 block font-medium text-slate-600">{label}</span>
+    {children}
+  </label>
+);
+
+export function SimpleBar({ data, color = '#6366f1', height = 260, vertical = false, dataKey = 'value' }) {
+  if (!data?.length) return <EmptyState />;
+  return (
+    <ResponsiveContainer width="100%" height={height}>
+      {vertical ? (
+        <BarChart data={data} layout="vertical" margin={{ left: 10 }}>
+          <CartesianGrid strokeDasharray="3 3" horizontal={false} />
+          <XAxis type="number" tick={{ fontSize: 11 }} />
+          <YAxis type="category" dataKey="name" width={120} tick={{ fontSize: 11 }} />
+          <Tooltip />
+          <Bar dataKey={dataKey} fill={color} radius={[0, 4, 4, 0]} />
+        </BarChart>
+      ) : (
+        <BarChart data={data}>
+          <CartesianGrid strokeDasharray="3 3" vertical={false} />
+          <XAxis dataKey="name" tick={{ fontSize: 11 }} interval={0} angle={-20} textAnchor="end" height={55} />
+          <YAxis tick={{ fontSize: 11 }} />
+          <Tooltip />
+          <Bar dataKey={dataKey} fill={color} radius={[4, 4, 0, 0]} />
+        </BarChart>
+      )}
+    </ResponsiveContainer>
+  );
+}
+
+export function SimplePie({ data, height = 260 }) {
+  if (!data?.length) return <EmptyState />;
+  return (
+    <ResponsiveContainer width="100%" height={height}>
+      <PieChart>
+        <Pie data={data} dataKey="value" nameKey="name" innerRadius={50} outerRadius={90} paddingAngle={2}>
+          {data.map((_, i) => <Cell key={i} fill={COLORS[i % COLORS.length]} />)}
+        </Pie>
+        <Tooltip />
+        <Legend wrapperStyle={{ fontSize: 12 }} />
+      </PieChart>
+    </ResponsiveContainer>
+  );
+}
+```
+
+FILE: frontend/src/components/Sidebar.jsx
+STATUS: NEW
+```jsx
+import { NavLink } from 'react-router-dom';
+import {
+  Brain, Briefcase, ClipboardCheck, Database, GitCompare, HelpCircle, Info, LayoutDashboard,
+  MessagesSquare, Share2, Target, Users, X,
+} from 'lucide-react';
+
+const NAV = [
+  ['/', 'Dashboard', LayoutDashboard], ['/candidates', 'Candidates', Users], ['/compare', 'Compare', GitCompare],
+  ['/interviews', 'Interviews', MessagesSquare], ['/questions', 'Questions', HelpCircle], ['/skills', 'Skills', Brain],
+  ['/roles', 'Roles', Briefcase], ['/graph', 'Knowledge Graph', Share2], ['/evaluation', 'Evaluation', ClipboardCheck],
+  ['/recommendations', 'Recommendations', Target], ['/database', 'Database & NoSQL', Database], ['/about', 'About', Info],
+];
+
+export default function Sidebar({ open, onClose }) {
+  return (
+    <>
+      {open && <div className="fixed inset-0 z-30 bg-slate-900/50 lg:hidden" onClick={onClose} />}
+      <aside className={`fixed inset-y-0 left-0 z-40 w-64 transform bg-slate-900 text-slate-200 transition lg:sticky lg:top-0 lg:h-screen lg:translate-x-0 ${open ? 'translate-x-0' : '-translate-x-full'}`}>
+        <div className="flex items-center justify-between px-5 py-5">
+          <div className="flex items-center gap-2">
+            <div className="rounded-lg bg-indigo-500 p-2"><Share2 size={18} className="text-white" /></div>
+            <div>
+              <div className="text-sm font-bold text-white">Interview KG</div>
+              <div className="text-[11px] text-slate-400">Neo4j + MongoDB</div>
+            </div>
+          </div>
+          <button className="lg:hidden" onClick={onClose}><X size={18} /></button>
+        </div>
+        <nav className="space-y-1 px-3">
+          {NAV.map(([to, label, Icon]) => (
+            <NavLink key={to} to={to} end={to === '/'} onClick={onClose}
+              className={({ isActive }) => `flex items-center gap-3 rounded-lg px-3 py-2 text-sm transition ${isActive ? 'bg-indigo-600 text-white' : 'text-slate-300 hover:bg-slate-800'}`}>
+              <Icon size={17} /> {label}
+            </NavLink>
+          ))}
+        </nav>
+      </aside>
+    </>
+  );
+}
+```
+
+FILE: frontend/src/components/Header.jsx
+STATUS: NEW
+```jsx
+import { useEffect } from 'react';
+import { Menu } from 'lucide-react';
+import { api } from '../services/api';
+import { useApi } from '../hooks/useApi';
+import { Badge } from './ui';
+
+export default function Header({ onMenu }) {
+  const { data, error, reload } = useApi(api.health, []);
+  useEffect(() => {
+    const t = setInterval(reload, 30000);
+    return () => clearInterval(t);
+  }, [reload]);
+  return (
+    <header className="sticky top-0 z-20 flex items-center justify-between border-b border-slate-200 bg-white/90 px-4 py-3 backdrop-blur lg:px-8">
+      <div className="flex items-center gap-3">
+        <button className="lg:hidden" onClick={onMenu}><Menu /></button>
+        <div className="text-sm font-semibold text-slate-700">Interview Knowledge Graph for AI-Powered Candidate Evaluation</div>
+      </div>
+      <div className="flex items-center gap-2">
+        <Badge tone={error ? 'rose' : 'emerald'}>{error ? 'API offline' : 'API online'}</Badge>
+        {data && <Badge tone={data.neo4j ? 'emerald' : 'rose'}>Neo4j</Badge>}
+        {data && <Badge tone={data.mongodb ? 'emerald' : 'rose'}>MongoDB</Badge>}
+      </div>
+    </header>
+  );
+}
+```
+
+FILE: frontend/src/components/Layout.jsx
+STATUS: NEW
+```jsx
+import { useState } from 'react';
+import { Outlet } from 'react-router-dom';
+import Header from './Header';
+import Sidebar from './Sidebar';
+
+export default function Layout() {
+  const [open, setOpen] = useState(false);
+  return (
+    <div className="min-h-screen bg-slate-50 lg:flex">
+      <Sidebar open={open} onClose={() => setOpen(false)} />
+      <div className="min-w-0 flex-1">
+        <Header onMenu={() => setOpen(true)} />
+        <main className="mx-auto max-w-[1500px] p-4 lg:p-8"><Outlet /></main>
+      </div>
+    </div>
+  );
+}
+```
+
+FILE: frontend/src/components/CandidateTable.jsx
+STATUS: NEW
+```jsx
+import { Pencil, Trash2 } from 'lucide-react';
+import { Badge, EmptyState, ScoreBar } from './ui';
+
+export default function CandidateTable({ items, onOpen, onEdit, onDelete }) {
+  if (!items.length) return <EmptyState text="No candidates match the filters" />;
+  return (
+    <div className="card overflow-x-auto">
+      <table className="min-w-full divide-y divide-slate-200">
+        <thead className="bg-slate-50">
+          <tr>{['ID', 'Name', 'Domain', 'Education', 'Exp (yrs)', 'Job type', 'Avg score', 'Skill coverage', 'Role compatibility', ''].map((h) => <th key={h} className="th">{h}</th>)}</tr>
+        </thead>
+        <tbody className="divide-y divide-slate-100">
+          {items.map((c) => (
+            <tr key={c.candidate_id} className="cursor-pointer hover:bg-indigo-50/40" onClick={() => onOpen(c)}>
+              <td className="td font-mono text-xs">{c.candidate_id}</td>
+              <td className="td font-medium text-slate-900">{c.name}</td>
+              <td className="td">{c.domain || '—'}</td>
+              <td className="td max-w-[200px] truncate">{c.education || '—'}</td>
+              <td className="td">{c.experience_years ?? '—'}</td>
+              <td className="td">{c.job_type ? <Badge>{c.job_type}</Badge> : '—'}</td>
+              <td className="td">{c.avg_score ?? '—'}</td>
+              <td className="td w-36"><div className="mb-1 text-xs">{c.skill_coverage}%</div><ScoreBar value={c.skill_coverage} tone="emerald" /></td>
+              <td className="td text-xs">{c.best_role ? <>{c.best_role} <Badge tone="indigo">{c.best_role_compat}%</Badge></> : '—'}</td>
+              <td className="td whitespace-nowrap" onClick={(e) => e.stopPropagation()}>
+                <button className="mr-2 text-slate-400 hover:text-indigo-600" onClick={() => onEdit(c)}><Pencil size={15} /></button>
+                <button className="text-slate-400 hover:text-rose-600" onClick={() => onDelete(c)}><Trash2 size={15} /></button>
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+```
+
+FILE: frontend/src/components/CandidateCard.jsx
+STATUS: NEW
+```jsx
+import { Link } from 'react-router-dom';
+import { Badge, SkillBadge } from './ui';
+
+export default function CandidateCard({ item }) {
+  return (
+    <Link to={`/candidates/${encodeURIComponent(item.candidate_id)}`} className="card block p-4 transition hover:border-indigo-300">
+      <div className="flex items-center justify-between">
+        <div className="font-semibold text-slate-900">{item.name}</div>
+        <Badge tone="indigo">{item.similarity}% similar</Badge>
+      </div>
+      <div className="mb-2 text-xs text-slate-500">{item.candidate_id} · {item.domain || 'No domain'}</div>
+      <div className="flex flex-wrap gap-1">{item.shared_skills.map((s) => <SkillBadge key={s} name={s} tone="emerald" />)}</div>
+    </Link>
+  );
+}
+```
+
+FILE: frontend/src/components/EvaluationCard.jsx
+STATUS: NEW
+```jsx
+import { Badge, ScoreBar } from './ui';
+
+const Metric = ({ label, value, max = 10, suffix = '/10', tone }) => (
+  <div className="card p-4">
+    <div className="text-xs font-medium uppercase text-slate-500">{label}</div>
+    <div className="my-1 text-2xl font-bold text-slate-900">{value}<span className="text-sm font-normal text-slate-400">{suffix}</span></div>
+    <ScoreBar value={value} max={max} tone={tone} />
+  </div>
+);
+
+export default function EvaluationCard({ ev }) {
+  return (
+    <div className="space-y-4">
+      <div className="rounded-lg border border-amber-200 bg-amber-50 px-4 py-2 text-xs text-amber-800">{ev.label}</div>
+      <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
+        <Metric label="Overall" value={ev.overall_score} />
+        <Metric label="Technical" value={ev.technical_score} tone="emerald" />
+        <Metric label="Communication" value={ev.communication_score} tone="amber" />
+        <Metric label="Skill coverage" value={ev.skill_coverage} max={100} suffix="%" tone="emerald" />
+      </div>
+      <p className="text-sm text-slate-700">{ev.summary} {ev.role && <Badge tone="indigo">{ev.role}</Badge>}</p>
+      <div className="grid gap-4 md:grid-cols-2">
+        <div className="card p-4">
+          <h4 className="mb-2 font-semibold text-emerald-700">Strengths</h4>
+          <ul className="list-disc space-y-1 pl-5 text-sm text-slate-700">{ev.strengths.map((s, i) => <li key={i}>{s}</li>)}</ul>
+        </div>
+        <div className="card p-4">
+          <h4 className="mb-2 font-semibold text-rose-700">Weaknesses</h4>
+          <ul className="list-disc space-y-1 pl-5 text-sm text-slate-700">{ev.weaknesses.map((s, i) => <li key={i}>{s}</li>)}</ul>
+        </div>
+      </div>
+      <div className="card p-4">
+        <h4 className="mb-2 font-semibold text-slate-800">How this was calculated</h4>
+        <ul className="list-decimal space-y-1 pl-5 text-xs text-slate-600">{ev.explanation.map((s, i) => <li key={i}>{s}</li>)}</ul>
+      </div>
+    </div>
+  );
+}
+```
+
+FILE: frontend/src/components/GraphViewer.jsx
+STATUS: NEW
+```jsx
+import { useEffect, useMemo, useRef, useState } from 'react';
+import ForceGraph2D from 'react-force-graph-2d';
+
+export const NODE_COLORS = {
+  Candidate: '#6366f1', Question: '#f59e0b', Skill: '#10b981', Role: '#ef4444', Company: '#8b5cf6',
+  Answer: '#94a3b8', Technology: '#06b6d4', InterviewRound: '#ec4899',
+};
+const RADIUS = { Candidate: 7, Role: 7, Company: 7, Skill: 5.5, Technology: 5, InterviewRound: 5, Question: 4, Answer: 3 };
+
+export default function GraphViewer({ data, visibleTypes, search, selectedId, onSelect, height = 620 }) {
+  const wrap = useRef(null);
+  const fg = useRef(null);
+  const fitted = useRef(false);
+  const [width, setWidth] = useState(800);
+
+  useEffect(() => {
+    const el = wrap.current;
+    if (!el) return undefined;
+    const ro = new ResizeObserver(() => setWidth(el.clientWidth));
+    ro.observe(el);
+    setWidth(el.clientWidth);
+    return () => ro.disconnect();
+  }, []);
+
+  const graph = useMemo(() => {
+    const nodes = data.nodes.filter((n) => visibleTypes.has(n.type)).map((n) => ({ ...n }));
+    const ids = new Set(nodes.map((n) => n.id));
+    const links = data.links.filter((l) => ids.has(l.source) && ids.has(l.target)).map((l) => ({ ...l }));
+    fitted.current = false;
+    return { nodes, links };
+  }, [data, visibleTypes]);
+
+  const q = search.trim().toLowerCase();
+  const matches = (n) => q && n.name.toLowerCase().includes(q);
+
+  return (
+    <div ref={wrap} className="card overflow-hidden bg-white">
+      <ForceGraph2D
+        ref={fg}
+        width={width}
+        height={height}
+        graphData={graph}
+        nodeLabel={(n) => `${n.type}: ${n.name}`}
+        linkLabel={(l) => l.type}
+        linkColor={() => 'rgba(100,116,139,0.35)'}
+        linkDirectionalArrowLength={3}
+        linkDirectionalArrowRelPos={1}
+        cooldownTicks={120}
+        onEngineStop={() => {
+          if (!fitted.current && fg.current) {
+            fg.current.zoomToFit(400, 40);
+            fitted.current = true;
+          }
+        }}
+        onNodeClick={(n) => onSelect(n)}
+        onBackgroundClick={() => onSelect(null)}
+        nodeCanvasObject={(node, ctx, scale) => {
+          const r = RADIUS[node.type] || 4;
+          const dim = q && !matches(node);
+          ctx.globalAlpha = dim ? 0.12 : 1;
+          ctx.beginPath();
+          ctx.arc(node.x, node.y, r, 0, 2 * Math.PI);
+          ctx.fillStyle = NODE_COLORS[node.type] || '#64748b';
+          ctx.fill();
+          if (node.id === selectedId || matches(node)) {
+            ctx.lineWidth = 2 / scale;
+            ctx.strokeStyle = '#0f172a';
+            ctx.stroke();
+          }
+          const showLabel = !dim && (scale > 2.2 || ['Candidate', 'Role', 'Company'].includes(node.type) || matches(node) || node.id === selectedId);
+          if (showLabel) {
+            const label = node.name.length > 28 ? `${node.name.slice(0, 27)}…` : node.name;
+            ctx.font = `${11 / scale}px Sans-Serif`;
+            ctx.textAlign = 'center';
+            ctx.textBaseline = 'top';
+            ctx.fillStyle = '#1e293b';
+            ctx.fillText(label, node.x, node.y + r + 1);
+          }
+          ctx.globalAlpha = 1;
+        }}
+        nodePointerAreaPaint={(node, color, ctx) => {
+          ctx.fillStyle = color;
+          ctx.beginPath();
+          ctx.arc(node.x, node.y, (RADIUS[node.type] || 4) + 2, 0, 2 * Math.PI);
+          ctx.fill();
+        }}
+      />
+    </div>
+  );
+}
+```
+
+FILE: frontend/src/App.jsx
+STATUS: MODIFY
+```jsx
+import { BrowserRouter, Route, Routes } from 'react-router-dom';
+import Layout from './components/Layout';
+import About from './pages/About';
+import CandidateProfile from './pages/CandidateProfile';
+import Candidates from './pages/Candidates';
+import CompareCandidates from './pages/CompareCandidates';
+import Dashboard from './pages/Dashboard';
+import Database from './pages/Database';
+import Evaluation from './pages/Evaluation';
+import Interviews from './pages/Interviews';
+import KnowledgeGraph from './pages/KnowledgeGraph';
+import Questions from './pages/Questions';
+import Recommendations from './pages/Recommendations';
+import Roles from './pages/Roles';
+import Skills from './pages/Skills';
+
+export default function App() {
+  return (
+    <BrowserRouter>
+      <Routes>
+        <Route element={<Layout />}>
+          <Route path="/" element={<Dashboard />} />
+          <Route path="/candidates" element={<Candidates />} />
+          <Route path="/candidates/:id" element={<CandidateProfile />} />
+          <Route path="/compare" element={<CompareCandidates />} />
+          <Route path="/interviews" element={<Interviews />} />
+          <Route path="/questions" element={<Questions />} />
+          <Route path="/skills" element={<Skills />} />
+          <Route path="/roles" element={<Roles />} />
+          <Route path="/graph" element={<KnowledgeGraph />} />
+          <Route path="/evaluation" element={<Evaluation />} />
+          <Route path="/recommendations" element={<Recommendations />} />
+          <Route path="/database" element={<Database />} />
+          <Route path="/about" element={<About />} />
+        </Route>
+      </Routes>
+    </BrowserRouter>
+  );
+}
+```
+
+FILE: frontend/src/pages/Dashboard.jsx
+STATUS: NEW
+```jsx
+import { useState } from 'react';
+import { Briefcase, Brain, Database, HelpCircle, MessageSquare, Share2, Smile, Users, Video } from 'lucide-react';
+import { api, errMsg } from '../services/api';
+import { useApi } from '../hooks/useApi';
+import { Async, ChartCard, PageHeader, SimpleBar, SimplePie, StatCard } from '../components/ui';
+
+export default function Dashboard() {
+  const state = useApi(api.dashboard, []);
+  const [seeding, setSeeding] = useState(false);
+  const [msg, setMsg] = useState('');
+
+  const seed = async () => {
+    setSeeding(true);
+    setMsg('');
+    try {
+      await api.seed();
+      state.reload();
+    } catch (e) {
+      setMsg(errMsg(e));
+    } finally {
+      setSeeding(false);
+    }
+  };
+
+  return (
+    <>
+      <PageHeader title="Dashboard" subtitle="Live counts from Neo4j and MongoDB. Data is synthetic (CareerCorpus profiles matched to Ankshi questions)."
+        actions={<button className="btn-primary" disabled={seeding} onClick={seed}><Database size={16} />{seeding ? 'Seeding…' : 'Seed / re-seed database'}</button>} />
+      {msg && <div className="mb-4 rounded-lg bg-rose-50 p-3 text-sm text-rose-700">{msg}</div>}
+      <Async state={state}>
+        {(d) => (
+          <div className="space-y-6">
+            {!d.mongodb_available && <div className="rounded-lg bg-amber-50 p-3 text-sm text-amber-800">MongoDB is unavailable: interview and emotion statistics are hidden.</div>}
+            {d.counts.candidates === 0 && <div className="rounded-lg bg-indigo-50 p-3 text-sm text-indigo-800">The graph is empty. Click “Seed / re-seed database”.</div>}
+            <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
+              <StatCard label="Candidates" value={d.counts.candidates} icon={Users} />
+              <StatCard label="Questions" value={d.counts.questions} icon={HelpCircle} tone="amber" />
+              <StatCard label="Answers" value={d.counts.answers} icon={MessageSquare} tone="emerald" />
+              <StatCard label="Skills" value={d.counts.skills} icon={Brain} tone="cyan" />
+              <StatCard label="Roles" value={d.counts.roles} icon={Briefcase} tone="rose" />
+              <StatCard label="Relationships" value={d.counts.relationships} icon={Share2} />
+              <StatCard label="Interviews (MongoDB)" value={d.counts.interviews} icon={Video} tone="emerald" />
+              <StatCard label="Emotion logs (MongoDB)" value={d.counts.emotion_logs} icon={Smile} tone="amber" />
+            </div>
+            <div className="card p-4 text-sm text-slate-600">Average answer score (system-derived): <b className="text-slate-900">{d.avg_score ?? '—'} / 10</b></div>
+            <div className="grid gap-6 lg:grid-cols-2">
+              <ChartCard title="Candidates by domain"><SimpleBar data={d.charts.candidates_by_domain} /></ChartCard>
+              <ChartCard title="Questions by difficulty"><SimplePie data={d.charts.questions_by_difficulty} /></ChartCard>
+              <ChartCard title="Role distribution" subtitle="Candidates interviewed per role"><SimpleBar data={d.charts.role_distribution} vertical color="#ef4444" /></ChartCard>
+              <ChartCard title="Skill distribution" subtitle="Candidates holding each skill"><SimpleBar data={d.charts.skill_distribution} vertical color="#10b981" height={320} /></ChartCard>
+              <ChartCard title="Average answer score by role"><SimpleBar data={d.charts.score_by_role} color="#f59e0b" /></ChartCard>
+              <ChartCard title="Emotion distribution" subtitle="MongoDB emotion_logs"><SimplePie data={d.charts.emotion_distribution} /></ChartCard>
+              <ChartCard title="Interview statistics" subtitle="Rounds per candidate"><SimpleBar data={d.charts.rounds_per_candidate} color="#8b5cf6" /></ChartCard>
+            </div>
+          </div>
+        )}
+      </Async>
+    </>
+  );
+}
+```
+
+FILE: frontend/src/pages/Candidates.jsx
+STATUS: NEW
+```jsx
+import { useState } from 'react';
+import { useNavigate } from 'react-router-dom';
+import { Plus, Search } from 'lucide-react';
+import { api, errMsg } from '../services/api';
+import { useApi } from '../hooks/useApi';
+import CandidateTable from '../components/CandidateTable';
+import { Async, Field, Modal, PageHeader } from '../components/ui';
+
+const EMPTY = { name: '', education: '', domain: '', job_type: '', experience_years: '', skills: '' };
+
+function CandidateForm({ initial, onSaved, onClose }) {
+  const editing = !!initial?.candidate_id;
+  const [form, setForm] = useState(editing ? { ...initial, skills: (initial.skills || []).join(', '), experience_years: initial.experience_years ?? '' } : EMPTY);
+  const [err, setErr] = useState('');
+  const [busy, setBusy] = useState(false);
+  const set = (k) => (e) => setForm({ ...form, [k]: e.target.value });
+
+  const submit = async (e) => {
+    e.preventDefault();
+    setBusy(true);
+    setErr('');
+    const body = {
+      name: form.name, education: form.education || null, domain: form.domain || null, job_type: form.job_type || null,
+      experience_years: form.experience_years === '' ? null : Number(form.experience_years),
+      skills: form.skills.split(',').map((s) => s.trim()).filter(Boolean),
+    };
+    try {
+      if (editing) await api.updateCandidate(initial.candidate_id, body);
+      else await api.createCandidate(body);
+      onSaved();
+    } catch (ex) {
+      setErr(errMsg(ex));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <form onSubmit={submit}>
+      <Field label="Name"><input required className="input" value={form.name} onChange={set('name')} /></Field>
+      <div className="grid grid-cols-2 gap-3">
+        <Field label="Domain"><input className="input" value={form.domain || ''} onChange={set('domain')} /></Field>
+        <Field label="Job type"><input className="input" value={form.job_type || ''} onChange={set('job_type')} /></Field>
+        <Field label="Education"><input className="input" value={form.education || ''} onChange={set('education')} /></Field>
+        <Field label="Experience (years)"><input type="number" min="0" step="0.5" className="input" value={form.experience_years} onChange={set('experience_years')} /></Field>
+      </div>
+      <Field label="Skills (comma separated)"><input className="input" value={form.skills} onChange={set('skills')} placeholder="Python, SQL, Docker" /></Field>
+      {err && <div className="mb-3 rounded bg-rose-50 p-2 text-sm text-rose-700">{err}</div>}
+      <div className="flex justify-end gap-2">
+        <button type="button" className="btn-ghost" onClick={onClose}>Cancel</button>
+        <button className="btn-primary" disabled={busy}>{busy ? 'Saving…' : editing ? 'Update' : 'Create'}</button>
+      </div>
+    </form>
+  );
+}
+
+export default function Candidates() {
+  const nav = useNavigate();
+  const [q, setQ] = useState('');
+  const [domain, setDomain] = useState('');
+  const [jobType, setJobType] = useState('');
+  const [modal, setModal] = useState(null); // {mode:'create'|'edit', item}
+  const [error, setError] = useState('');
+  const state = useApi(() => api.candidates({ q, domain, job_type: jobType }), [q, domain, jobType]);
+
+  const remove = async (c) => {
+    if (!window.confirm(`Delete ${c.name} (${c.candidate_id}) and all their answers, rounds and interview documents?`)) return;
+    try {
+      await api.deleteCandidate(c.candidate_id);
+      state.reload();
+    } catch (e) {
+      setError(errMsg(e));
+    }
+  };
+
+  return (
+    <>
+      <PageHeader title="Candidates" subtitle="Searchable candidate table backed by Neo4j. Click a row to open the profile."
+        actions={<button className="btn-primary" onClick={() => setModal({ mode: 'create' })}><Plus size={16} /> New candidate</button>} />
+      <div className="mb-4 flex flex-wrap gap-3">
+        <div className="relative min-w-[240px] flex-1">
+          <Search size={16} className="absolute left-3 top-2.5 text-slate-400" />
+          <input className="input pl-9" placeholder="Search by name, id, education or skill…" value={q} onChange={(e) => setQ(e.target.value)} />
+        </div>
+        <select className="input w-48" value={domain} onChange={(e) => setDomain(e.target.value)}>
+          <option value="">All domains</option>
+          {(state.data?.facets.domains || []).map((d) => <option key={d}>{d}</option>)}
+        </select>
+        <select className="input w-44" value={jobType} onChange={(e) => setJobType(e.target.value)}>
+          <option value="">All job types</option>
+          {(state.data?.facets.job_types || []).map((d) => <option key={d}>{d}</option>)}
+        </select>
+      </div>
+      {error && <div className="mb-3 rounded bg-rose-50 p-2 text-sm text-rose-700">{error}</div>}
+      <Async state={state}>
+        {(d) => (
+          <>
+            <div className="mb-2 text-xs text-slate-500">{d.total} candidate(s)</div>
+            <CandidateTable items={d.items} onOpen={(c) => nav(`/candidates/${encodeURIComponent(c.candidate_id)}`)}
+              onEdit={(c) => setModal({ mode: 'edit', item: c })} onDelete={remove} />
+          </>
+        )}
+      </Async>
+      {modal && (
+        <Modal title={modal.mode === 'edit' ? 'Edit candidate' : 'New candidate'} onClose={() => setModal(null)}>
+          <CandidateForm initial={modal.item} onClose={() => setModal(null)} onSaved={() => { setModal(null); state.reload(); }} />
+        </Modal>
+      )}
+    </>
+  );
+}
+```
+
+FILE: frontend/src/pages/CandidateProfile.jsx
+STATUS: NEW
+```jsx
+import { Link, useParams } from 'react-router-dom';
+import { ArrowLeft } from 'lucide-react';
+import { api } from '../services/api';
+import { useApi } from '../hooks/useApi';
+import CandidateCard from '../components/CandidateCard';
+import { Async, Badge, ChartCard, EmptyState, PageHeader, ScoreBar, SimpleBar, SimplePie, SkillBadge, StatCard, diffTone } from '../components/ui';
+
+export default function CandidateProfile() {
+  const { id } = useParams();
+  const prof = useApi(() => api.candidate(id), [id]);
+  const ev = useApi(() => api.evaluation(id), [id]);
+  const recs = useApi(() => api.roleRecs(id), [id]);
+  const sim = useApi(() => api.similar(id), [id]);
+
+  return (
+    <>
+      <Link to="/candidates" className="mb-3 inline-flex items-center gap-1 text-sm text-indigo-600"><ArrowLeft size={14} /> Candidates</Link>
+      <Async state={prof}>
+        {(p) => {
+          const c = p.candidate;
+          return (
+            <div className="space-y-6">
+              <PageHeader title={c.name} subtitle={`${c.candidate_id} · ${c.education || 'Education n/a'} · ${c.domain || 'Domain n/a'} · ${c.job_type || 'Job type n/a'}`}
+                actions={<Link to="/graph" state={{ candidateId: c.candidate_id }} className="btn-ghost">View in graph</Link>} />
+              <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
+                <StatCard label="Experience (yrs)" value={c.experience_years} />
+                <StatCard label="Interview rounds" value={p.stats.rounds} tone="amber" />
+                <StatCard label="Questions answered" value={p.stats.answers} tone="emerald" />
+                <StatCard label="Average score" value={p.stats.avg_score} tone="rose" />
+              </div>
+              <div className="card p-4">
+                <h3 className="mb-2 font-semibold">Skills</h3>
+                <div className="flex flex-wrap gap-1.5">{p.skills.length ? p.skills.map((s) => <SkillBadge key={s} name={s} />) : <span className="text-sm text-slate-400">No skills</span>}</div>
+              </div>
+              <div className="grid gap-6 lg:grid-cols-2">
+                <ChartCard title="Answer scores" subtitle="Per question (0–10)">
+                  <SimpleBar data={p.answers.map((a) => ({ name: a.question_id, value: a.score }))} color="#6366f1" />
+                </ChartCard>
+                <ChartCard title="Emotion summary" subtitle="MongoDB emotion_logs">
+                  {p.emotions.length ? <SimplePie data={p.emotions.map((e) => ({ name: e.label, value: e.count }))} /> : <EmptyState text="No emotion logs" />}
+                </ChartCard>
+              </div>
+              <div className="grid gap-6 lg:grid-cols-2">
+                <Async state={ev}>
+                  {(e) => (
+                    <div className="card p-4">
+                      <h3 className="mb-2 font-semibold">Evaluation <Badge tone="indigo">{e.overall_score}/10</Badge></h3>
+                      <p className="mb-2 text-xs text-slate-500">{e.label}</p>
+                      <div className="grid gap-3 sm:grid-cols-2">
+                        <div><h4 className="text-sm font-medium text-emerald-700">Strengths</h4><ul className="list-disc pl-4 text-xs text-slate-600">{e.strengths.map((s, i) => <li key={i}>{s}</li>)}</ul></div>
+                        <div><h4 className="text-sm font-medium text-rose-700">Weaknesses</h4><ul className="list-disc pl-4 text-xs text-slate-600">{e.weaknesses.map((s, i) => <li key={i}>{s}</li>)}</ul></div>
+                      </div>
+                    </div>
+                  )}
+                </Async>
+                <Async state={recs}>
+                  {(r) => (
+                    <div className="card p-4">
+                      <h3 className="mb-1 font-semibold">Recommended roles &amp; skill gaps</h3>
+                      <p className="mb-3 text-xs text-slate-500">{r.label}</p>
+                      <div className="space-y-3">
+                        {r.roles.slice(0, 3).map((x) => (
+                          <div key={x.role_id}>
+                            <div className="flex justify-between text-sm"><b>{x.title}</b><span>{x.coverage}%</span></div>
+                            <ScoreBar value={x.coverage} tone="emerald" />
+                            {x.missing.length > 0 && <div className="mt-1 flex flex-wrap gap-1">{x.missing.map((m) => <SkillBadge key={m} name={m} tone="rose" />)}</div>}
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                </Async>
+              </div>
+              <div className="card overflow-x-auto">
+                <table className="min-w-full divide-y divide-slate-200">
+                  <thead className="bg-slate-50"><tr>{['Round', 'Question', 'Difficulty', 'Score', 'Skills demonstrated'].map((h) => <th key={h} className="th">{h}</th>)}</tr></thead>
+                  <tbody className="divide-y divide-slate-100">
+                    {p.answers.map((a) => (
+                      <tr key={a.answer_id}>
+                        <td className="td font-mono text-xs">{a.round_id.split('__').pop()}</td>
+                        <td className="td max-w-md">{a.question}</td>
+                        <td className="td"><Badge tone={diffTone(a.difficulty)}>{a.difficulty || '—'}</Badge></td>
+                        <td className="td font-semibold">{a.score}</td>
+                        <td className="td"><div className="flex flex-wrap gap-1">{a.skills.map((s) => <SkillBadge key={s} name={s} tone="emerald" />)}</div></td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+              <div>
+                <h3 className="mb-3 font-semibold">Similar candidates</h3>
+                <Async state={sim}>
+                  {(s) => (s.items.length ? <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3">{s.items.map((i) => <CandidateCard key={i.candidate_id} item={i} />)}</div> : <EmptyState text="No candidates share skills" />)}
+                </Async>
+              </div>
+            </div>
+          );
+        }}
+      </Async>
+    </>
+  );
+}
+```
+
+FILE: frontend/src/pages/CompareCandidates.jsx
+STATUS: NEW
+```jsx
+import { useState } from 'react';
+import { Bar, BarChart, CartesianGrid, Legend, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts';
+import { api } from '../services/api';
+import { useApi } from '../hooks/useApi';
+import { Async, ChartCard, EmptyState, Loading, PageHeader, SkillBadge } from '../components/ui';
+
+const load = (id) => (id ? Promise.all([api.candidate(id), api.evaluation(id), api.roleRecs(id)]) : Promise.resolve(null));
+
+export default function CompareCandidates() {
+  const list = useApi(() => api.candidates(), []);
+  const [a, setA] = useState('');
+  const [b, setB] = useState('');
+  const A = useApi(() => load(a), [a]);
+  const B = useApi(() => load(b), [b]);
+
+  const select = (value, set, other) => (
+    <select className="input" value={value} onChange={(e) => set(e.target.value)}>
+      <option value="">Select candidate…</option>
+      {(list.data?.items || []).filter((c) => c.candidate_id !== other).map((c) => <option key={c.candidate_id} value={c.candidate_id}>{c.candidate_id} · {c.name}</option>)}
+    </select>
+  );
+
+  const ready = A.data && B.data;
+  let body = <EmptyState text="Select two candidates to compare" />;
+  if ((a && A.loading) || (b && B.loading)) body = <Loading />;
+  else if (ready) {
+    const [pa, ea, ra] = A.data;
+    const [pb, eb, rb] = B.data;
+    const sa = new Set(pa.skills.map((s) => s.toLowerCase()));
+    const sb = new Set(pb.skills.map((s) => s.toLowerCase()));
+    const shared = pa.skills.filter((s) => sb.has(s.toLowerCase()));
+    const chart = [
+      { name: 'Overall', A: ea.overall_score, B: eb.overall_score },
+      { name: 'Technical', A: ea.technical_score, B: eb.technical_score },
+      { name: 'Communication', A: ea.communication_score, B: eb.communication_score },
+      { name: 'Coverage (÷10)', A: ea.skill_coverage / 10, B: eb.skill_coverage / 10 },
+      { name: 'Avg answer', A: pa.stats.avg_score || 0, B: pb.stats.avg_score || 0 },
+    ];
+    const rows = [
+      ['Education', pa.candidate.education, pb.candidate.education],
+      ['Domain', pa.candidate.domain, pb.candidate.domain],
+      ['Experience (yrs)', pa.candidate.experience_years, pb.candidate.experience_years],
+      ['Questions answered', pa.stats.answers, pb.stats.answers],
+      ['Best-fit role', `${ra.roles[0]?.title} (${ra.roles[0]?.coverage}%)`, `${rb.roles[0]?.title} (${rb.roles[0]?.coverage}%)`],
+    ];
+    body = (
+      <div className="space-y-6">
+        <ChartCard title="Score comparison" subtitle={ea.label}>
+          <ResponsiveContainer width="100%" height={300}>
+            <BarChart data={chart}><CartesianGrid strokeDasharray="3 3" vertical={false} /><XAxis dataKey="name" tick={{ fontSize: 11 }} /><YAxis domain={[0, 10]} /><Tooltip /><Legend />
+              <Bar dataKey="A" name={pa.candidate.name} fill="#6366f1" radius={[4, 4, 0, 0]} />
+              <Bar dataKey="B" name={pb.candidate.name} fill="#10b981" radius={[4, 4, 0, 0]} />
+            </BarChart>
+          </ResponsiveContainer>
+        </ChartCard>
+        <div className="card overflow-x-auto">
+          <table className="min-w-full divide-y divide-slate-200">
+            <thead className="bg-slate-50"><tr><th className="th">Attribute</th><th className="th">{pa.candidate.name}</th><th className="th">{pb.candidate.name}</th></tr></thead>
+            <tbody className="divide-y divide-slate-100">{rows.map(([l, x, y]) => <tr key={l}><td className="td font-medium">{l}</td><td className="td">{x ?? '—'}</td><td className="td">{y ?? '—'}</td></tr>)}</tbody>
+          </table>
+        </div>
+        <div className="grid gap-4 lg:grid-cols-3">
+          <div className="card p-4"><h4 className="mb-2 text-sm font-semibold">Only {pa.candidate.name}</h4><div className="flex flex-wrap gap-1">{pa.skills.filter((s) => !sb.has(s.toLowerCase())).map((s) => <SkillBadge key={s} name={s} />)}</div></div>
+          <div className="card p-4"><h4 className="mb-2 text-sm font-semibold">Shared skills</h4><div className="flex flex-wrap gap-1">{shared.map((s) => <SkillBadge key={s} name={s} tone="emerald" />)}</div></div>
+          <div className="card p-4"><h4 className="mb-2 text-sm font-semibold">Only {pb.candidate.name}</h4><div className="flex flex-wrap gap-1">{pb.skills.filter((s) => !sa.has(s.toLowerCase())).map((s) => <SkillBadge key={s} name={s} tone="cyan" />)}</div></div>
+        </div>
+        <div className="grid gap-4 md:grid-cols-2">
+          {[[pa, ea, ra], [pb, eb, rb]].map(([p, e, r]) => (
+            <div key={p.candidate.candidate_id} className="card p-4">
+              <h4 className="mb-2 font-semibold">{p.candidate.name}</h4>
+              <h5 className="text-sm font-medium text-emerald-700">Strengths</h5><ul className="mb-2 list-disc pl-5 text-xs text-slate-600">{e.strengths.map((s, i) => <li key={i}>{s}</li>)}</ul>
+              <h5 className="text-sm font-medium text-rose-700">Weaknesses</h5><ul className="mb-2 list-disc pl-5 text-xs text-slate-600">{e.weaknesses.map((s, i) => <li key={i}>{s}</li>)}</ul>
+              <h5 className="text-sm font-medium">Role compatibility</h5><ul className="text-xs text-slate-600">{r.roles.slice(0, 3).map((x) => <li key={x.role_id}>{x.title}: {x.coverage}%</li>)}</ul>
+            </div>
+          ))}
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <>
+      <PageHeader title="Compare candidates" subtitle="Side-by-side comparison of skills, scores, role compatibility and evaluation." />
+      <Async state={list}>
+        {() => <div className="mb-6 grid gap-3 md:grid-cols-2">{select(a, setA, b)}{select(b, setB, a)}</div>}
+      </Async>
+      {body}
+    </>
+  );
+}
+```
+
+FILE: frontend/src/pages/Interviews.jsx
+STATUS: NEW
+```jsx
+import { useState } from 'react';
+import { Eye, Pencil, Plus, Trash2 } from 'lucide-react';
+import { api, errMsg } from '../services/api';
+import { useApi } from '../hooks/useApi';
+import { Async, Badge, EmptyState, Field, Loading, Modal, PageHeader, SkillBadge, diffTone } from '../components/ui';
+
+function InterviewDetail({ id }) {
+  const s = useApi(() => api.interview(id), [id]);
+  return (
+    <Async state={s}>
+      {(d) => (
+        <div className="space-y-4">
+          <div className="flex flex-wrap gap-2 text-sm">
+            <Badge tone="indigo">{d.candidate_id}</Badge><Badge>{d.round_label}</Badge><Badge tone="amber">{d.target_role}</Badge><Badge tone="emerald">{d.status}</Badge>
+            <span className="text-slate-500">{d.started_at && new Date(d.started_at).toLocaleString()}</span>
+          </div>
+          {d.qa.map((x, i) => (
+            <div key={x.answer_id} className="rounded-lg border border-slate-200 p-3">
+              <div className="mb-1 flex flex-wrap items-center gap-2 text-xs">
+                <b>Q{i + 1}</b> <Badge tone={diffTone(x.difficulty)}>{x.difficulty}</Badge><Badge>{x.category}</Badge>
+                <span className="ml-auto font-semibold">Score {x.score}/10</span>
+              </div>
+              <p className="text-sm font-medium text-slate-800">{x.question}</p>
+              <p className="mt-1 text-sm text-slate-600">{x.answer}</p>
+              <div className="mt-2 flex flex-wrap items-center gap-1">
+                {(x.skills_tested || []).map((s) => <SkillBadge key={s} name={s} tone="amber" />)}
+                {(x.skills_demonstrated || []).map((s) => <SkillBadge key={`d${s}`} name={s} tone="emerald" />)}
+                {x.emotion && <Badge tone="cyan">{x.emotion.label} · {x.emotion.confidence}</Badge>}
+              </div>
+              {x.feedback && <p className="mt-2 text-xs text-slate-500">{x.feedback.summary} Strengths: {x.feedback.strengths}. Gaps: {x.feedback.weaknesses}.</p>}
+            </div>
+          ))}
+          {d.emotion_timeline?.length > 0 && <p className="text-xs text-slate-500">{d.emotion_timeline.length} embedded emotion samples (MongoDB array).</p>}
+          <details className="text-xs text-slate-500"><summary className="cursor-pointer">Metadata (flexible schema)</summary><pre className="mt-2 overflow-x-auto rounded bg-slate-50 p-2">{JSON.stringify(d.metadata, null, 2)}</pre></details>
+        </div>
+      )}
+    </Async>
+  );
+}
+
+function InterviewForm({ initial, onSaved, onClose }) {
+  const editing = !!initial;
+  const cands = useApi(() => api.candidates(), []);
+  const qs = useApi(() => api.questions({ page_size: 200 }), []);
+  const [form, setForm] = useState({ candidate_id: '', round_label: '', target_role: initial?.target_role || '', notes: '' });
+  const [qa, setQa] = useState([{ question_id: '', answer_text: '', score: '' }]);
+  const [status, setStatus] = useState(initial?.status || 'completed');
+  const [err, setErr] = useState('');
+  const [busy, setBusy] = useState(false);
+
+  const submit = async (e) => {
+    e.preventDefault();
+    setBusy(true);
+    setErr('');
+    try {
+      if (editing) await api.updateInterview(initial.interview_id, { target_role: form.target_role || null, notes: form.notes || null, status });
+      else {
+        await api.createInterview({
+          candidate_id: form.candidate_id, round_label: form.round_label || null, target_role: form.target_role || null, notes: form.notes || null,
+          qa: qa.filter((x) => x.question_id && x.answer_text).map((x) => ({ question_id: x.question_id, answer_text: x.answer_text, score: x.score === '' ? null : Number(x.score) })),
+        });
+      }
+      onSaved();
+    } catch (ex) {
+      setErr(errMsg(ex));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  if (!editing && (cands.loading || qs.loading)) return <Loading />;
+  return (
+    <form onSubmit={submit}>
+      {!editing && (
+        <div className="grid grid-cols-2 gap-3">
+          <Field label="Candidate">
+            <select required className="input" value={form.candidate_id} onChange={(e) => setForm({ ...form, candidate_id: e.target.value })}>
+              <option value="">Select…</option>{(cands.data?.items || []).map((c) => <option key={c.candidate_id} value={c.candidate_id}>{c.candidate_id} · {c.name}</option>)}
+            </select>
+          </Field>
+          <Field label="Round label (optional)"><input className="input" value={form.round_label} onChange={(e) => setForm({ ...form, round_label: e.target.value })} placeholder="R3" /></Field>
+        </div>
+      )}
+      <div className="grid grid-cols-2 gap-3">
+        <Field label="Target role"><input className="input" value={form.target_role} onChange={(e) => setForm({ ...form, target_role: e.target.value })} /></Field>
+        {editing ? (
+          <Field label="Status"><select className="input" value={status} onChange={(e) => setStatus(e.target.value)}>{['completed', 'in_review', 'cancelled'].map((s) => <option key={s}>{s}</option>)}</select></Field>
+        ) : <Field label="Notes"><input className="input" value={form.notes} onChange={(e) => setForm({ ...form, notes: e.target.value })} /></Field>}
+      </div>
+      {editing && <Field label="Notes"><input className="input" value={form.notes} onChange={(e) => setForm({ ...form, notes: e.target.value })} /></Field>}
+      {!editing && (
+        <div className="mb-3 space-y-3">
+          {qa.map((x, i) => (
+            <div key={i} className="rounded-lg border border-slate-200 p-3">
+              <select className="input mb-2" value={x.question_id} onChange={(e) => setQa(qa.map((y, j) => (j === i ? { ...y, question_id: e.target.value } : y)))}>
+                <option value="">Select question…</option>{(qs.data?.items || []).map((q) => <option key={q.question_id} value={q.question_id}>{q.question_id} · {q.text.slice(0, 70)}</option>)}
+              </select>
+              <textarea className="input mb-2" rows={2} placeholder="Answer" value={x.answer_text} onChange={(e) => setQa(qa.map((y, j) => (j === i ? { ...y, answer_text: e.target.value } : y)))} />
+              <div className="flex items-center gap-2">
+                <input type="number" min="0" max="10" step="0.1" className="input w-40" placeholder="Score (optional)" value={x.score} onChange={(e) => setQa(qa.map((y, j) => (j === i ? { ...y, score: e.target.value } : y)))} />
+                {qa.length > 1 && <button type="button" className="text-xs text-rose-600" onClick={() => setQa(qa.filter((_, j) => j !== i))}>Remove</button>}
+              </div>
+            </div>
+          ))}
+          <button type="button" className="btn-ghost" onClick={() => setQa([...qa, { question_id: '', answer_text: '', score: '' }])}><Plus size={14} /> Add question</button>
+        </div>
+      )}
+      {err && <div className="mb-3 rounded bg-rose-50 p-2 text-sm text-rose-700">{err}</div>}
+      <div className="flex justify-end gap-2"><button type="button" className="btn-ghost" onClick={onClose}>Cancel</button><button className="btn-primary" disabled={busy}>{busy ? 'Saving…' : editing ? 'Update' : 'Create'}</button></div>
+    </form>
+  );
+}
+
+export default function Interviews() {
+  const [candidate, setCandidate] = useState('');
+  const [role, setRole] = useState('');
+  const [page, setPage] = useState(1);
+  const [modal, setModal] = useState(null);
+  const [error, setError] = useState('');
+  const cands = useApi(() => api.candidates(), []);
+  const roles = useApi(() => api.roles(), []);
+  const state = useApi(() => api.interviews({ candidate_id: candidate, target_role: role, page, page_size: 15 }), [candidate, role, page]);
+
+  const remove = async (i) => {
+    if (!window.confirm(`Delete interview ${i.interview_id}? This removes the MongoDB document, its emotion logs and the graph answers.`)) return;
+    try { await api.deleteInterview(i.interview_id); state.reload(); } catch (e) { setError(errMsg(e)); }
+  };
+
+  return (
+    <>
+      <PageHeader title="Interview explorer" subtitle="Flexible interview documents come from MongoDB; feedback and skills are joined from Neo4j."
+        actions={<button className="btn-primary" onClick={() => setModal({ mode: 'create' })}><Plus size={16} /> New interview</button>} />
+      <div className="mb-4 flex flex-wrap gap-3">
+        <select className="input w-60" value={candidate} onChange={(e) => { setCandidate(e.target.value); setPage(1); }}>
+          <option value="">All candidates</option>{(cands.data?.items || []).map((c) => <option key={c.candidate_id} value={c.candidate_id}>{c.candidate_id} · {c.name}</option>)}
+        </select>
+        <select className="input w-60" value={role} onChange={(e) => { setRole(e.target.value); setPage(1); }}>
+          <option value="">All roles</option>{(roles.data?.items || []).map((r) => <option key={r.role_id}>{r.title}</option>)}
+        </select>
+      </div>
+      {error && <div className="mb-3 rounded bg-rose-50 p-2 text-sm text-rose-700">{error}</div>}
+      <Async state={state}>
+        {(d) => (d.items.length ? (
+          <>
+            <div className="card overflow-x-auto">
+              <table className="min-w-full divide-y divide-slate-200">
+                <thead className="bg-slate-50"><tr>{['Interview', 'Candidate', 'Round', 'Role', 'Date', 'Questions', 'Avg score', ''].map((h) => <th key={h} className="th">{h}</th>)}</tr></thead>
+                <tbody className="divide-y divide-slate-100">
+                  {d.items.map((i) => (
+                    <tr key={i.interview_id}>
+                      <td className="td font-mono text-xs">{i.interview_id}</td><td className="td">{i.candidate_id}</td><td className="td">{i.round_label}</td>
+                      <td className="td">{i.target_role}</td><td className="td">{i.started_at && new Date(i.started_at).toLocaleDateString()}</td>
+                      <td className="td">{i.questions}</td><td className="td font-semibold">{i.avg_score ?? '—'}</td>
+                      <td className="td whitespace-nowrap">
+                        <button className="mr-2 text-slate-400 hover:text-indigo-600" onClick={() => setModal({ mode: 'view', item: i })}><Eye size={15} /></button>
+                        <button className="mr-2 text-slate-400 hover:text-indigo-600" onClick={() => setModal({ mode: 'edit', item: i })}><Pencil size={15} /></button>
+                        <button className="text-slate-400 hover:text-rose-600" onClick={() => remove(i)}><Trash2 size={15} /></button>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+            <div className="mt-3 flex items-center justify-between text-sm text-slate-500">
+              <span>{d.total} interview(s)</span>
+              <div className="flex gap-2"><button className="btn-ghost" disabled={page <= 1} onClick={() => setPage(page - 1)}>Previous</button><button className="btn-ghost" disabled={page * d.page_size >= d.total} onClick={() => setPage(page + 1)}>Next</button></div>
+            </div>
+          </>
+        ) : <EmptyState text="No interviews found" />)}
+      </Async>
+      {modal?.mode === 'view' && <Modal wide title={`Interview ${modal.item.interview_id}`} onClose={() => setModal(null)}><InterviewDetail id={modal.item.interview_id} /></Modal>}
+      {(modal?.mode === 'create' || modal?.mode === 'edit') && (
+        <Modal wide={modal.mode === 'create'} title={modal.mode === 'edit' ? 'Edit interview' : 'New interview'} onClose={() => setModal(null)}>
+          <InterviewForm initial={modal.mode === 'edit' ? modal.item : null} onClose={() => setModal(null)} onSaved={() => { setModal(null); state.reload(); }} />
+        </Modal>
+      )}
+    </>
+  );
+}
+```
+
+FILE: frontend/src/pages/Questions.jsx
+STATUS: NEW
+```jsx
+import { useState } from 'react';
+import { Pencil, Plus, Search, Trash2 } from 'lucide-react';
+import { api, errMsg } from '../services/api';
+import { useApi } from '../hooks/useApi';
+import { Async, Badge, EmptyState, Field, Modal, PageHeader, SkillBadge, diffTone } from '../components/ui';
+
+function QuestionForm({ initial, onSaved, onClose }) {
+  const editing = !!initial?.question_id;
+  const [f, setF] = useState(editing ? { ...initial, skills: (initial.skills || []).join(', ') } : { text: '', category: '', difficulty: '', target_role: '', experience: '', skills: '' });
+  const [err, setErr] = useState('');
+  const set = (k) => (e) => setF({ ...f, [k]: e.target.value });
+  const submit = async (e) => {
+    e.preventDefault();
+    const body = { text: f.text, category: f.category || null, difficulty: f.difficulty || null, target_role: f.target_role || null, experience: f.experience || null, skills: f.skills.split(',').map((s) => s.trim()).filter(Boolean) };
+    try {
+      if (editing) await api.updateQuestion(initial.question_id, body); else await api.createQuestion(body);
+      onSaved();
+    } catch (ex) { setErr(errMsg(ex)); }
+  };
+  return (
+    <form onSubmit={submit}>
+      <Field label="Question text"><textarea required rows={3} className="input" value={f.text} onChange={set('text')} /></Field>
+      <div className="grid grid-cols-2 gap-3">
+        <Field label="Category"><input className="input" value={f.category || ''} onChange={set('category')} /></Field>
+        <Field label="Difficulty"><select className="input" value={f.difficulty || ''} onChange={set('difficulty')}><option value="">—</option>{['Easy', 'Medium', 'Hard'].map((d) => <option key={d}>{d}</option>)}</select></Field>
+        <Field label="Target role"><input className="input" value={f.target_role || ''} onChange={set('target_role')} /></Field>
+        <Field label="Experience level"><input className="input" value={f.experience || ''} onChange={set('experience')} /></Field>
+      </div>
+      <Field label="Skills tested (comma separated)"><input className="input" value={f.skills} onChange={set('skills')} /></Field>
+      {err && <div className="mb-3 rounded bg-rose-50 p-2 text-sm text-rose-700">{err}</div>}
+      <div className="flex justify-end gap-2"><button type="button" className="btn-ghost" onClick={onClose}>Cancel</button><button className="btn-primary">{editing ? 'Update' : 'Create'}</button></div>
+    </form>
+  );
+}
+
+function QuestionDetail({ id }) {
+  const s = useApi(() => api.question(id), [id]);
+  return (
+    <Async state={s}>
+      {(q) => (
+        <div className="space-y-3 text-sm">
+          <p className="font-medium text-slate-900">{q.text}</p>
+          <div className="flex flex-wrap gap-2"><Badge tone={diffTone(q.difficulty)}>{q.difficulty}</Badge><Badge>{q.category}</Badge><Badge tone="amber">{q.target_role}</Badge><Badge tone="indigo">{q.experience}</Badge></div>
+          <div><div className="mb-1 text-xs font-semibold uppercase text-slate-500">Related skills (TESTS_SKILL)</div><div className="flex flex-wrap gap-1">{q.skills.length ? q.skills.map((x) => <SkillBadge key={x} name={x} tone="emerald" />) : <span className="text-slate-400">None derived</span>}</div></div>
+          <div className="text-slate-600">Answers recorded: <b>{q.answers}</b> · Average score: <b>{q.avg_score ?? '—'}</b></div>
+          {q.keywords?.length > 0 && <div className="text-xs text-slate-500">Keywords: {q.keywords.join(', ')}</div>}
+        </div>
+      )}
+    </Async>
+  );
+}
+
+export default function Questions() {
+  const [f, setF] = useState({ q: '', category: '', difficulty: '', role: '', experience: '' });

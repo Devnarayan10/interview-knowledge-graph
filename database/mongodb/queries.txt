@@ -1,0 +1,49 @@
+// MongoDB query pack. Run with:
+//   docker compose exec mongodb mongosh interview_db --file /docker-entrypoint-initdb.d/queries.js
+// or paste into mongosh one at a time (each is a DA2 screenshot candidate).
+db = db.getSiblingDB('interview_db');
+
+// M1 find + projection + sort + limit: latest interviews
+printjson(db.raw_interviews.find({}, { candidate_id: 1, round_label: 1, target_role: 1, started_at: 1 })
+  .sort({ started_at: -1 }).limit(5).toArray());
+
+// M2 filter by role with projection
+printjson(db.raw_interviews.find({ target_role: { $exists: true } }, { target_role: 1, candidate_id: 1 }).limit(5).toArray());
+
+// M3 embedded array query: interviews containing a Hard question
+printjson(db.raw_interviews.find({ 'qa.difficulty': 'Hard' }, { candidate_id: 1, 'qa.$': 1 }).limit(3).toArray());
+
+// M4 emotion distribution
+printjson(db.emotion_logs.aggregate([
+  { $group: { _id: '$label', count: { $sum: 1 }, avg_confidence: { $avg: '$confidence' } } },
+  { $sort: { count: -1 } }]).toArray());
+
+// M5 average emotion confidence
+printjson(db.emotion_logs.aggregate([{ $group: { _id: null, avg_confidence: { $avg: '$confidence' }, samples: { $sum: 1 } } }]).toArray());
+
+// M6 interviews per role
+printjson(db.raw_interviews.aggregate([{ $group: { _id: '$target_role', interviews: { $sum: 1 } } }, { $sort: { interviews: -1 } }]).toArray());
+
+// M7 average answer score ($unwind on embedded qa)
+printjson(db.raw_interviews.aggregate([{ $unwind: '$qa' }, { $group: { _id: null, avg_score: { $avg: '$qa.score' }, answers: { $sum: 1 } } }]).toArray());
+
+// M8 candidate interview statistics
+printjson(db.raw_interviews.aggregate([
+  { $unwind: '$qa' },
+  { $group: { _id: '$candidate_id', interviews: { $addToSet: '$_id' }, answers: { $sum: 1 }, avg_score: { $avg: '$qa.score' } } },
+  { $project: { interviews: { $size: '$interviews' }, answers: 1, avg_score: { $round: ['$avg_score', 2] } } },
+  { $sort: { avg_score: -1 } }, { $limit: 10 }]).toArray());
+
+// M9 emotion trend across the interview phases
+printjson(db.emotion_logs.aggregate([
+  { $group: { _id: { phase: '$phase', label: '$label' }, count: { $sum: 1 } } },
+  { $sort: { '_id.phase': 1, count: -1 } }]).toArray());
+
+// M10 UPDATE: annotate an interview, then DELETE a low-confidence emotion log (demo on one doc)
+var one = db.raw_interviews.findOne({}, { _id: 1 });
+printjson(db.raw_interviews.updateOne({ _id: one._id }, { $set: { 'metadata.reviewed': true } }));
+printjson(db.emotion_logs.deleteMany({ confidence: { $lt: 0.0 } }));   // safe no-op demo
+
+// M11 index inspection + explain (shows IXSCAN)
+printjson(db.raw_interviews.getIndexes());
+printjson(db.emotion_logs.find({ candidate_id: one.candidate_id }).explain('executionStats').queryPlanner.winningPlan);

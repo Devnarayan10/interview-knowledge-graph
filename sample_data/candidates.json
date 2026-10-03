@@ -1,0 +1,10 @@
+[
+  {
+    "candidate_id": "C001",
+    "name": "Aditi Rao",
+    "email": "aditi.rao@example.com",
+    "experience_years": 2,
+    "applied_companies": ["COMP001"],
+    "skills": ["S010", "S003", "S007"]
+  }
+]
