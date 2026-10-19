@@ -16,8 +16,13 @@ class InterviewCreate(BaseModel):
     notes: Optional[str] = None
     qa: List[InterviewQA] = Field(min_length=1)
 
+class InterviewAnswerUpdate(BaseModel):
+    answer_id: str
+    answer_text: str = Field(min_length=1)
+
 
 class InterviewUpdate(BaseModel):
     target_role: Optional[str] = None
     notes: Optional[str] = None
     status: Optional[str] = None
+    answers: Optional[List[InterviewAnswerUpdate]] = None

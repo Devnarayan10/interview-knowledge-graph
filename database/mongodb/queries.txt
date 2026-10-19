@@ -39,11 +39,52 @@ printjson(db.emotion_logs.aggregate([
   { $group: { _id: { phase: '$phase', label: '$label' }, count: { $sum: 1 } } },
   { $sort: { '_id.phase': 1, count: -1 } }]).toArray());
 
-// M10 UPDATE: annotate an interview, then DELETE a low-confidence emotion log (demo on one doc)
-var one = db.raw_interviews.findOne({}, { _id: 1 });
-printjson(db.raw_interviews.updateOne({ _id: one._id }, { $set: { 'metadata.reviewed': true } }));
-printjson(db.emotion_logs.deleteMany({ confidence: { $lt: 0.0 } }));   // safe no-op demo
+ // M10 Safe CRUD demonstration using a temporary interview
+ // No original interview or emotion log is modified.
 
-// M11 index inspection + explain (shows IXSCAN)
-printjson(db.raw_interviews.getIndexes());
-printjson(db.emotion_logs.find({ candidate_id: one.candidate_id }).explain('executionStats').queryPlanner.winningPlan);
+ var demoId = "DA2_DEMO_TEMP";
+
+ // Clean up a leftover demo record, if one exists.
+ db.raw_interviews.deleteOne({ _id: demoId });
+
+ // CREATE
+ printjson(db.raw_interviews.insertOne({
+   _id: demoId,
+   candidate_id: "DA2_DEMO_TEMP",
+   round_id: "DA2_DEMO_TEMP",
+   target_role: "Demo Role",
+   metadata: { reviewed: false, demo: true }
+ }));
+
+ // READ
+ printjson(db.raw_interviews.findOne({ _id: demoId }));
+
+ // UPDATE
+ printjson(db.raw_interviews.updateOne(
+   { _id: demoId },
+   { $set: { "metadata.reviewed": true } }
+ ));
+
+ // VERIFY UPDATE
+ printjson(db.raw_interviews.findOne({ _id: demoId }));
+
+ // DELETE only the temporary record
+ printjson(db.raw_interviews.deleteOne({ _id: demoId }));
+
+ // VERIFY CLEANUP
+ printjson(db.raw_interviews.findOne({ _id: demoId }));
+
+
+ // M11 Index inspection and indexed query execution
+
+ // Display available indexes
+ printjson(db.raw_interviews.getIndexes());
+
+ // Inspect the candidate_id index using a known candidate
+ printjson(
+   db.raw_interviews.find({ candidate_id: "C001" })
+     .explain("executionStats")
+ );
+
+ // Expected: IXSCAN using candidate_id_1,
+ // with approximately five C001 interview documents returned.

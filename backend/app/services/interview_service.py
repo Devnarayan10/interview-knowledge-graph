@@ -117,26 +117,185 @@ def create_interview(p: InterviewCreate) -> dict:
 
 def update_interview(iid: str, p: InterviewUpdate) -> dict:
     data = p.model_dump(exclude_unset=True)
-    sets = {k: v for k, v in data.items() if k in ("target_role", "status")}
+    answers = data.pop("answers", None)
+
+    sets = {
+        k: v for k, v in data.items()
+        if k in ("target_role", "status")
+    }
+
     if "notes" in data:
         sets["metadata.notes"] = data["notes"]
-    sets["metadata.updated_at"] = datetime.utcnow().isoformat()
-    res = _col().update_one({"_id": iid}, {"$set": sets})
-    if res.matched_count == 0:
-        raise NotFoundError(f"Interview {iid} not found")
-    if "target_role" in data:
-        run("MATCH (r:InterviewRound {round_id:$id}) SET r.target_role=$role", id=iid, role=data["target_role"])
-    return get_interview(iid)
 
+    sets["metadata.updated_at"] = datetime.utcnow().isoformat()
+
+    col = _col()
+    doc = col.find_one({"_id": iid})
+
+    if not doc:
+        raise NotFoundError(f"Interview {iid} not found")
+
+    if answers is not None:
+        qa = doc.get("qa", [])
+        transcript = doc.get("transcript", [])
+
+        known_ids = {item["answer_id"] for item in qa}
+        supplied_ids = [item["answer_id"] for item in answers]
+
+        if len(supplied_ids) != len(set(supplied_ids)):
+            raise ValueError("Duplicate answer IDs")
+
+        unknown_ids = set(supplied_ids) - known_ids
+        if unknown_ids:
+            raise ValueError(f"Unknown answer IDs: {unknown_ids}")
+
+        for change in answers:
+            answer_id = change["answer_id"]
+            new_text = change["answer_text"]
+
+            for item in qa:
+                if item["answer_id"] != answer_id:
+                    continue
+
+                old_text = item["answer"]
+                item["answer"] = new_text
+                keywords = item.get("keywords") or []
+                n_skills = len(item.get("skills_tested") or [])
+
+                score, coverage, word_count, matched = score_answer(
+                new_text, keywords, n_skills
+                )
+
+                missed = [
+                    keyword for keyword in keywords
+                    if keyword not in matched
+                    ]
+
+                item["score"] = score
+                item["keyword_coverage"] = coverage
+                item["word_count"] = word_count
+                item["evaluation_needs_review"] = False
+
+                # Update the corresponding candidate transcript entry.
+                candidate_time = item.get("timestamp_sec", 0) + 30
+
+                for entry in transcript:
+                    if (
+                        entry.get("speaker") == "candidate"
+                        and entry.get("t") == candidate_time
+                    ):
+                        entry["text"] = new_text
+                        break
+                break
+
+        sets["qa"] = qa
+        sets["transcript"] = transcript
+
+    col.update_one({"_id": iid}, {"$set": sets})
+
+    if "target_role" in data:
+        run(
+            "MATCH (r:InterviewRound {round_id:$id}) "
+            "SET r.target_role=$role",
+            id=iid,
+            role=data["target_role"]
+        )
+
+        if answers is not None:
+            updated_qa = {
+            item["answer_id"]: item
+            for item in qa
+        }
+
+        for change in answers:
+            item = updated_qa[change["answer_id"]]
+
+            keywords = item.get("keywords") or []
+            matched = [
+                keyword for keyword in keywords
+                if keyword.lower() in item["answer"].lower()
+            ]
+            missed = [
+                keyword for keyword in keywords
+                if keyword not in matched
+            ]
+
+            strengths = ", ".join(matched[:4]) or "No matching keywords detected"
+            weaknesses = ", ".join(missed[:4]) or "No major gaps detected"
+
+            summary = (
+                f"Scored {item['score']}/10 on a "
+                f"{item.get('difficulty', 'Medium')} "
+                f"{item.get('category', 'General')} question "
+                f"(keyword coverage {item['keyword_coverage']:.0%})."
+            )
+
+            run(
+                """
+                MATCH (a:Answer {answer_id:$aid, round_id:$rid})
+                SET a.transcript_text=$answer,
+                    a.score=$score,
+                    a.keyword_coverage=$coverage,
+                    a.word_count=$words,
+                    a.evaluation_needs_review=false
+
+                MERGE (f:Feedback {feedback_id:$fid})
+                SET f.strengths=$strengths,
+                    f.weaknesses=$weaknesses,
+                    f.summary=$summary
+
+                MERGE (a)-[:RECEIVED]->(f)
+                """,
+                aid=item["answer_id"],
+                rid=iid,
+                fid="FB-" + item["answer_id"],
+                answer=item["answer"],
+                score=item["score"],
+                coverage=item["keyword_coverage"],
+                words=item["word_count"],
+                strengths=strengths,
+                weaknesses=weaknesses,
+                summary=summary
+            )
+
+    return get_interview(iid)
 
 def delete_interview(iid: str) -> dict:
     doc = _col().find_one({"_id": iid}, {"candidate_id": 1})
     if not doc:
         raise NotFoundError(f"Interview {iid} not found")
+
+    # Remove Neo4j emotion nodes linked to this interview's answers.
+    run(
+        """
+        MATCH (a:Answer {round_id:$rid})
+        MATCH (e:Emotion {answer_id:a.answer_id})
+        DETACH DELETE e
+        """,
+        rid=iid
+    )
+
+    # Remove answers and their feedback nodes.
+    run(
+        """
+        MATCH (a:Answer {round_id:$rid})
+        OPTIONAL MATCH (a)-[:RECEIVED]->(f:Feedback)
+        DETACH DELETE f, a
+        """,
+        rid=iid
+    )
+
+    # Remove the interview round from Neo4j.
+    run(
+        "MATCH (r:InterviewRound {round_id:$rid}) DETACH DELETE r",
+        rid=iid
+    )
+
+    # Delete MongoDB records after Neo4j cleanup succeeds.
+    removed = get_collection("emotion_logs").delete_many(
+        {"interview_id": iid}
+    ).deleted_count
+
     _col().delete_one({"_id": iid})
-    removed = get_collection("emotion_logs").delete_many({"interview_id": iid}).deleted_count
-    run("MATCH (e:Emotion {candidate_id:$cid}) WHERE e.answer_id IN [(a:Answer {round_id:$rid}) | a.answer_id] DETACH DELETE e",
-        cid=doc["candidate_id"], rid=iid)
-    run("MATCH (a:Answer {round_id:$rid}) OPTIONAL MATCH (a)-[:RECEIVED]->(f:Feedback) DETACH DELETE f, a", rid=iid)
-    run("MATCH (r:InterviewRound {round_id:$rid}) DETACH DELETE r", rid=iid)
+
     return {"deleted": iid, "emotion_logs_removed": removed}

@@ -3,7 +3,7 @@ import ForceGraph2D from 'react-force-graph-2d';
 
 export const NODE_COLORS = {
   Candidate: '#6366f1', Question: '#f59e0b', Skill: '#10b981', Role: '#ef4444', Company: '#8b5cf6',
-  Answer: '#94a3b8', Technology: '#06b6d4', InterviewRound: '#ec4899',
+  Answer: '#94a3b8', Technology: '#06b6d4', InterviewRound: '#ec4899', Emotion: '#f97316', Feedback: '#14b8a6',
 };
 const RADIUS = { Candidate: 7, Role: 7, Company: 7, Skill: 5.5, Technology: 5, InterviewRound: 5, Question: 4, Answer: 3 };
 

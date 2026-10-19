@@ -65,7 +65,7 @@ function QuestionDetail({ id }) {
           <div>
             <div className="mb-1 text-xs font-semibold uppercase text-slate-500">Related skills (TESTS_SKILL)</div>
             <div className="flex flex-wrap gap-1">
-              {q.skills.length ? q.skills.map((x) => <SkillBadge key={x} name={x} tone="emerald" />) : <span className="text-slate-400">None derived</span>}
+              {(q.skills || []).length ? (q.skills || []).map((x) => <SkillBadge key={x} name={x} tone="emerald" />) : <span className="text-slate-400">None derived</span>}
             </div>
           </div>
           <div className="text-slate-600">Answers recorded: <b>{q.answers}</b> · Average score: <b>{q.avg_score ?? '—'}</b></div>
@@ -135,7 +135,7 @@ export default function Questions() {
                       <td className="td">{q.category || '—'}</td>
                       <td className="td"><Badge tone={diffTone(q.difficulty)}>{q.difficulty || '—'}</Badge></td>
                       <td className="td text-xs">{q.target_role || '—'}</td>
-                      <td className="td"><div className="flex flex-wrap gap-1">{q.skills.slice(0, 3).map((s) => <SkillBadge key={s} name={s} tone="emerald" />)}</div></td>
+                      <td className="td"><div className="flex flex-wrap gap-1">{(q.skills || []).slice(0, 3).map((s) => <SkillBadge key={s} name={s} tone="emerald" />)}</div></td>
                       <td className="td whitespace-nowrap" onClick={(e) => e.stopPropagation()}>
                         <button className="mr-2 text-slate-400 hover:text-indigo-600" onClick={() => setModal({ mode: 'edit', item: q })}><Pencil size={15} /></button>
                         <button className="text-slate-400 hover:text-rose-600" onClick={() => remove(q)}><Trash2 size={15} /></button>

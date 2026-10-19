@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { Eye, Pencil, Plus, Trash2 } from 'lucide-react';
 import { api, errMsg } from '../services/api';
 import { useApi } from '../hooks/useApi';
@@ -14,6 +14,16 @@ function InterviewDetail({ id }) {
             <Badge tone="indigo">{d.candidate_id}</Badge><Badge>{d.round_label}</Badge><Badge tone="amber">{d.target_role}</Badge><Badge tone="emerald">{d.status}</Badge>
             <span className="text-slate-500">{d.started_at && new Date(d.started_at).toLocaleString()}</span>
           </div>
+          {d.metadata?.notes && (
+  <div className="rounded-lg border border-slate-200 bg-slate-50 p-3">
+    <p className="mb-1 text-sm font-semibold text-slate-800">
+      Interview Notes
+    </p>
+    <p className="whitespace-pre-wrap text-sm text-slate-600">
+      {d.metadata.notes}
+    </p>
+  </div>
+)}
           {d.qa.map((x, i) => (
             <div key={x.answer_id} className="rounded-lg border border-slate-200 p-3">
               <div className="mb-1 flex flex-wrap items-center gap-2 text-xs">
@@ -42,8 +52,49 @@ function InterviewForm({ initial, onSaved, onClose }) {
   const editing = !!initial;
   const cands = useApi(() => api.candidates(), []);
   const qs = useApi(() => api.questions({ page_size: 200 }), []);
-  const [form, setForm] = useState({ candidate_id: '', round_label: '', target_role: initial?.target_role || '', notes: '' });
+  const [form, setForm] = useState({
+  candidate_id: '',
+  round_label: '',
+  target_role: initial?.target_role || '',
+  notes: ''
+});
+
+const [loadingDetails, setLoadingDetails] = useState(!!initial);
+
+useEffect(() => {
+  if (!initial?.interview_id) return;
+
+  let active = true;
+
+  api.interview(initial.interview_id)
+    .then((data) => {
+      if (!active) return;
+      setEditAnswers(
+  (data.qa || []).map((item) => ({
+    answer_id: item.answer_id,
+    question: item.question,
+    answer_text: item.answer || ''
+  }))
+);
+      setForm((prev) => ({
+        ...prev,
+        target_role: data.target_role || '',
+        notes: data.metadata?.notes || ''
+      }));
+    })
+    .catch((error) => {
+      if (active) setErr(errMsg(error));
+    })
+    .finally(() => {
+      if (active) setLoadingDetails(false);
+    });
+
+  return () => {
+    active = false;
+  };
+}, [initial?.interview_id]);
   const [qa, setQa] = useState([{ question_id: '', answer_text: '', score: '' }]);
+  const [editAnswers, setEditAnswers] = useState([]);
   const [status, setStatus] = useState(initial?.status || 'completed');
   const [err, setErr] = useState('');
   const [busy, setBusy] = useState(false);
@@ -53,7 +104,17 @@ function InterviewForm({ initial, onSaved, onClose }) {
     setBusy(true);
     setErr('');
     try {
-      if (editing) await api.updateInterview(initial.interview_id, { target_role: form.target_role || null, notes: form.notes || null, status });
+      if (editing) {
+  await api.updateInterview(initial.interview_id, {
+    target_role: form.target_role || null,
+    notes: form.notes || null,
+    status,
+    answers: editAnswers.map((item) => ({
+      answer_id: item.answer_id,
+      answer_text: item.answer_text
+    }))
+  });
+}
       else {
         await api.createInterview({
           candidate_id: form.candidate_id, round_label: form.round_label || null, target_role: form.target_role || null, notes: form.notes || null,
@@ -68,9 +129,12 @@ function InterviewForm({ initial, onSaved, onClose }) {
     }
   };
 
-  if (!editing && (cands.loading || qs.loading)) return <Loading />;
+  if (loadingDetails || (!editing && (cands.loading || qs.loading))) {
+  return <Loading />;
+}
   return (
     <form onSubmit={submit}>
+
       {!editing && (
         <div className="grid grid-cols-2 gap-3">
           <Field label="Candidate">
@@ -88,6 +152,39 @@ function InterviewForm({ initial, onSaved, onClose }) {
         ) : <Field label="Notes"><input className="input" value={form.notes} onChange={(e) => setForm({ ...form, notes: e.target.value })} /></Field>}
       </div>
       {editing && <Field label="Notes"><input className="input" value={form.notes} onChange={(e) => setForm({ ...form, notes: e.target.value })} /></Field>}
+      {editing && editAnswers.length > 0 && (
+  <div className="mb-3 space-y-3">
+    <h3 className="text-sm font-semibold text-slate-800">
+      Edit Interview Answers
+    </h3>
+
+    {editAnswers.map((item, index) => (
+      <div
+        key={item.answer_id}
+        className="rounded-lg border border-slate-200 p-3"
+      >
+        <p className="mb-2 text-sm font-medium">
+          Q{index + 1}. {item.question}
+        </p>
+
+        <textarea
+          className="input"
+          rows={3}
+          value={item.answer_text}
+          onChange={(e) =>
+            setEditAnswers((previous) =>
+              previous.map((answer) =>
+                answer.answer_id === item.answer_id
+                  ? { ...answer, answer_text: e.target.value }
+                  : answer
+              )
+            )
+          }
+        />
+      </div>
+    ))}
+  </div>
+)}
       {!editing && (
         <div className="mb-3 space-y-3">
           {qa.map((x, i) => (

@@ -16,7 +16,12 @@ Q = {
     "skills": "UNWIND $rows AS r MERGE (s:Skill {skill_id:r.skill_id}) SET s.name=r.name, s.category=r.category",
     "roles": "UNWIND $rows AS r MERGE (x:Role {role_id:r.role_id}) SET x.title=r.title, x.department=r.department",
     "techs": "UNWIND $rows AS r MERGE (t:Technology {tech_id:r.tech_id}) SET t.name=r.name",
-    "companies": "UNWIND $rows AS r MERGE (c:Company {company_id:r.company_id}) SET c.name=r.name, c.industry=r.industry",
+    "companies": """UNWIND $rows AS r
+    MERGE (c:Company {company_id:r.company_id})
+    SET c.name=r.name,
+        c.industry=r.industry,
+        c.synthetic=r.synthetic,
+        c.data_source=r.data_source""",
     "candidates": """UNWIND $rows AS r MERGE (c:Candidate {candidate_id:r.candidate_id})
         SET c.name=r.name, c.email=r.email, c.experience_years=r.experience_years, c.education=r.education,
             c.domain=r.domain, c.job_type=r.job_type, c.skills=r.skills, c.source_id=r.source_id,
@@ -53,6 +58,7 @@ Q = {
     "role_skills": "UNWIND $rows AS r MATCH (s:Skill {skill_id:r.skill_id}) MATCH (x:Role {role_id:r.role_id}) MERGE (s)-[rel:REQUIRED_FOR]->(x) SET rel.weight=r.weight",
     "skill_tech": "UNWIND $rows AS r MATCH (s:Skill {skill_id:r.skill_id}) MATCH (t:Technology {tech_id:r.tech_id}) MERGE (s)-[:RELATED_TO]->(t)",
     "candidate_companies": "UNWIND $rows AS r MATCH (c:Candidate {candidate_id:r.candidate_id}) MATCH (co:Company {company_id:r.company_id}) MERGE (c)-[:APPLIED_TO]->(co)",
+    "role_companies": "UNWIND $rows AS r MATCH (ro:Role {role_id:r.role_id}) MATCH (co:Company {company_id:r.company_id}) MERGE (ro)-[:OFFERED_BY]->(co)",
 }
 
 ORDER = [
@@ -71,6 +77,7 @@ ORDER = [
     ("role_skills", "role_skills"),
     ("skill_tech", "skill_tech"),
     ("candidate_companies", "candidate_companies"),
+    ("role_companies", "role_companies"),
 ]
 
 
