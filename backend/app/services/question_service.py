@@ -4,6 +4,7 @@ from app.schemas.question import QuestionCreate
 from app.services.shared import run
 from app.utils.errors import ConflictError, NotFoundError
 from app.utils.helpers import new_id, skill_rows, slugify
+from app.database.mongodb import get_collection
 
 _WHERE = """
     ($q IS NULL OR toLower(q.text) CONTAINS toLower($q))
@@ -32,7 +33,7 @@ def list_questions(q=None, category=None, difficulty=None, role=None, experience
         RETURN collect(DISTINCT q.category) AS categories, collect(DISTINCT q.difficulty) AS difficulties,
                collect(DISTINCT q.target_role) AS roles, collect(DISTINCT q.experience) AS experiences
     """)[0]
-    facets = {k: sorted(v) for k, v in facets.items()}
+    facets = {k: sorted(x for x in v if x is not None) for k, v in facets.items()}
     return {"items": items, "total": total, "page": page, "page_size": page_size, "facets": facets}
 
 
@@ -97,14 +98,33 @@ def update_question(qid: str, data: dict) -> dict:
         _set_skills(qid, skills)
     return get_question(qid)
 
-
 def delete_question(qid: str) -> dict:
     get_question(qid)
+
+    linked_answers = run("""
+        MATCH (a:Answer)-[:IN_RESPONSE_TO]->(q:Question {question_id:$id})
+        RETURN count(DISTINCT a) AS total
+    """, id=qid)[0]["total"]
+
+    if linked_answers > 0:
+        raise ConflictError(
+            f"Cannot delete question {qid}: "
+            f"{linked_answers} recorded answer(s) exist in Neo4j."
+        )
+
+    mongo_references = get_collection("raw_interviews").count_documents({
+        "qa.question_id": qid
+    })
+
+    if mongo_references > 0:
+        raise ConflictError(
+            f"Cannot delete question {qid}: "
+            f"{mongo_references} interview document(s) reference it in MongoDB."
+        )
+
     run("""
         MATCH (q:Question {question_id:$id})
-        OPTIONAL MATCH (a:Answer)-[:IN_RESPONSE_TO]->(q)
-        OPTIONAL MATCH (a)-[:RECEIVED]->(f:Feedback)
-        OPTIONAL MATCH (e:Emotion {answer_id: a.answer_id})
-        DETACH DELETE f, e, a, q
+        DETACH DELETE q
     """, id=qid)
+
     return {"deleted": qid}

@@ -20,15 +20,16 @@ export default function CompareCandidates() {
     </select>
   );
 
-  const ready = A.data && B.data;
+  const ready = Array.isArray(A.data) && Array.isArray(B.data);
   let body = <EmptyState text="Select two candidates to compare" />;
   if ((a && A.loading) || (b && B.loading)) body = <Loading />;
+  else if ((a && A.error) || (b && B.error)) body = <div role="alert" className="card p-4 text-rose-700">Comparison could not be loaded: {String(A.error?.message || B.error?.message || 'Unknown error')}</div>;
   else if (ready) {
     const [pa, ea, ra] = A.data;
     const [pb, eb, rb] = B.data;
-    const sa = new Set(pa.skills.map((s) => s.toLowerCase()));
-    const sb = new Set(pb.skills.map((s) => s.toLowerCase()));
-    const shared = pa.skills.filter((s) => sb.has(s.toLowerCase()));
+    const sa = new Set((pa.skills || []).map((s) => s.toLowerCase()));
+    const sb = new Set((pb.skills || []).map((s) => s.toLowerCase()));
+    const shared = (pa.skills || []).filter((s) => sb.has(s.toLowerCase()));
     const chart = [
       { name: 'Overall', A: ea.overall_score, B: eb.overall_score },
       { name: 'Technical', A: ea.technical_score, B: eb.technical_score },
@@ -41,7 +42,7 @@ export default function CompareCandidates() {
       ['Domain', pa.candidate.domain, pb.candidate.domain],
       ['Experience (yrs)', pa.candidate.experience_years, pb.candidate.experience_years],
       ['Questions answered', pa.stats.answers, pb.stats.answers],
-      ['Best-fit role', `${ra.roles[0]?.title} (${ra.roles[0]?.coverage}%)`, `${rb.roles[0]?.title} (${rb.roles[0]?.coverage}%)`],
+      ['Best-fit role', `${(ra.roles || [])[0]?.title} (${(ra.roles || [])[0]?.coverage}%)`, `${(rb.roles || [])[0]?.title} (${(rb.roles || [])[0]?.coverage}%)`],
     ];
     body = (
       <div className="space-y-6">
@@ -60,9 +61,9 @@ export default function CompareCandidates() {
           </table>
         </div>
         <div className="grid gap-4 lg:grid-cols-3">
-          <div className="card p-4"><h4 className="mb-2 text-sm font-semibold">Only {pa.candidate.name}</h4><div className="flex flex-wrap gap-1">{pa.skills.filter((s) => !sb.has(s.toLowerCase())).map((s) => <SkillBadge key={s} name={s} />)}</div></div>
+          <div className="card p-4"><h4 className="mb-2 text-sm font-semibold">Only {pa.candidate.name}</h4><div className="flex flex-wrap gap-1">{(pa.skills || []).filter((s) => !sb.has(s.toLowerCase())).map((s) => <SkillBadge key={s} name={s} />)}</div></div>
           <div className="card p-4"><h4 className="mb-2 text-sm font-semibold">Shared skills</h4><div className="flex flex-wrap gap-1">{shared.map((s) => <SkillBadge key={s} name={s} tone="emerald" />)}</div></div>
-          <div className="card p-4"><h4 className="mb-2 text-sm font-semibold">Only {pb.candidate.name}</h4><div className="flex flex-wrap gap-1">{pb.skills.filter((s) => !sa.has(s.toLowerCase())).map((s) => <SkillBadge key={s} name={s} tone="cyan" />)}</div></div>
+          <div className="card p-4"><h4 className="mb-2 text-sm font-semibold">Only {pb.candidate.name}</h4><div className="flex flex-wrap gap-1">{(pb.skills || []).filter((s) => !sa.has(s.toLowerCase())).map((s) => <SkillBadge key={s} name={s} tone="cyan" />)}</div></div>
         </div>
         <div className="grid gap-4 md:grid-cols-2">
           {[[pa, ea, ra], [pb, eb, rb]].map(([p, e, r]) => (
@@ -70,7 +71,7 @@ export default function CompareCandidates() {
               <h4 className="mb-2 font-semibold">{p.candidate.name}</h4>
               <h5 className="text-sm font-medium text-emerald-700">Strengths</h5><ul className="mb-2 list-disc pl-5 text-xs text-slate-600">{e.strengths.map((s, i) => <li key={i}>{s}</li>)}</ul>
               <h5 className="text-sm font-medium text-rose-700">Weaknesses</h5><ul className="mb-2 list-disc pl-5 text-xs text-slate-600">{e.weaknesses.map((s, i) => <li key={i}>{s}</li>)}</ul>
-              <h5 className="text-sm font-medium">Role compatibility</h5><ul className="text-xs text-slate-600">{r.roles.slice(0, 3).map((x) => <li key={x.role_id}>{x.title}: {x.coverage}%</li>)}</ul>
+              <h5 className="text-sm font-medium">Role compatibility</h5><ul className="text-xs text-slate-600">{(r.roles || []).slice(0, 3).map((x) => <li key={x.role_id}>{x.title}: {x.coverage}%</li>)}</ul>
             </div>
           ))}
         </div>

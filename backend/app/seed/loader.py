@@ -143,7 +143,20 @@ def transform(rows: list[dict[str, str]]) -> dict[str, Any]:
         role_candidates[role].add(cid)
         cand_roles.add((cid, role_id))
 
+        # Documented, conservative category-to-skill mapping for behavioral questions.
+        # These mappings describe skills a question is intended to test, not proof of ability.
+        CATEGORY_SKILLS = {
+            "leadership": ("Leadership", "Team Management"),
+            "team collaboration": ("Communication", "Team Management"),
+            "conflict resolution": ("Communication", "Negotiation"),
+            "work style": ("Project Management", "Communication"),
+            "culture fit": ("Communication",),
+            "motivation": ("Communication",),
+            "adaptability": ("Project Management",),
+            "career goals": ("Communication",),
+        }
         tested = find_skills(qtext + " " + " ".join(kws))
+        tested = sorted(set(tested) | {name.lower() for name in CATEGORY_SKILLS.get(cat.lower(), ()) if name.lower() in skills})
         shown = find_skills(atext + " " + " ".join(kws))
 
         if qid not in questions:
@@ -270,7 +283,37 @@ def transform(rows: list[dict[str, str]]) -> dict[str, Any]:
                 "industry": r.get("industry") or None,
             }
             cand_company.add((cid, "CO-" + slugify(company)))
+    # Synthetic companies for DA2 demonstration.
+    # These are fictional companies, not verified employers.
+    DEMO_COMPANIES = {
+        "Accountant": ("CO-demo-accounting", "Demo Accounting Services", "Accounting"),
+        "Banking / Financial Analyst": ("CO-demo-banking", "Demo Banking Group", "Banking"),
+        "Fashion / Apparel Professional": ("CO-demo-fashion", "Demo Fashion Studio", "Fashion"),
+        "Financial Analyst": ("CO-demo-finance", "Demo Financial Consulting", "Finance"),
+        "Research Assistant": ("CO-demo-research", "Demo Research Institute", "Research"),
+        "Teacher / Trainer": ("CO-demo-education", "Demo Learning Academy", "Education"),
+    }
 
+    role_companies = []
+
+    for role_name in role_domains:
+        if role_name not in DEMO_COMPANIES:
+            continue
+
+        company_id, company_name, industry = DEMO_COMPANIES[role_name]
+
+        companies[company_id] = {
+            "company_id": company_id,
+            "name": company_name,
+            "industry": industry,
+            "synthetic": True,
+            "data_source": "DA2 demonstration",
+        }
+
+        role_companies.append({
+            "role_id": "R-" + slugify(role_name),
+            "company_id": company_id,
+        })
     # Roles + REQUIRED_FOR
     roles, role_skills = {}, []
 
@@ -365,7 +408,7 @@ def transform(rows: list[dict[str, str]]) -> dict[str, Any]:
             "candidate_id",
             "company_id"
         ),
-
+        "role_companies": role_companies,
         "role_skills": role_skills,
         "skill_tech": skill_tech,
         "mongo_interviews": list(interviews.values()),

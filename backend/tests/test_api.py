@@ -1,3 +1,4 @@
+import pytest
 from fastapi.testclient import TestClient
 
 import app.main as main
@@ -34,3 +35,54 @@ def test_question_endpoint(monkeypatch):
     monkeypatch.setattr(question_service, "list_questions", lambda *a, **k: {"items": [], "total": 0, "page": 1, "page_size": 20, "facets": {}})
     r = client.get("/api/questions?page=1&page_size=20")
     assert r.status_code == 200 and r.json()["total"] == 0
+def test_question_delete_blocked_by_neo4j(monkeypatch):
+    from app.utils.errors import ConflictError
+
+    monkeypatch.setattr(
+        question_service, "get_question",
+        lambda qid: {"question_id": qid}
+    )
+
+    def fake_run(query, **kwargs):
+        if "count(DISTINCT a) AS total" in query:
+            return [{"total": 2}]
+        raise AssertionError("Question deletion must not execute")
+
+    monkeypatch.setattr(question_service, "run", fake_run)
+    monkeypatch.setattr(
+        question_service, "get_collection",
+        lambda name: (_ for _ in ()).throw(
+            AssertionError("MongoDB should not be queried")
+        )
+    )
+
+    with pytest.raises(ConflictError):
+        question_service.delete_question("Q-TEST")
+
+
+def test_question_delete_blocked_by_mongodb(monkeypatch):
+    from app.utils.errors import ConflictError
+
+    monkeypatch.setattr(
+        question_service, "get_question",
+        lambda qid: {"question_id": qid}
+    )
+
+    def fake_run(query, **kwargs):
+        if "count(DISTINCT a) AS total" in query:
+            return [{"total": 0}]
+        raise AssertionError("Question deletion must not execute")
+
+    class FakeCollection:
+        def count_documents(self, query):
+            assert query == {"qa.question_id": "Q-TEST"}
+            return 1
+
+    monkeypatch.setattr(question_service, "run", fake_run)
+    monkeypatch.setattr(
+        question_service, "get_collection",
+        lambda name: FakeCollection()
+    )
+
+    with pytest.raises(ConflictError):
+        question_service.delete_question("Q-TEST")

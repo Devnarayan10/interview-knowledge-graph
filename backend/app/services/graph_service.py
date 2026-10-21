@@ -3,9 +3,10 @@
 from app.services.shared import run
 from app.utils.errors import NotFoundError
 
-DEFAULT_TYPES = ["Candidate", "Question", "Skill", "Role", "Company", "Answer", "Technology", "InterviewRound"]
-_KEY = ("labels({v})[0] + ':' + toString(coalesce({v}.candidate_id, {v}.question_id, {v}.skill_id, {v}.role_id, "
-        "{v}.company_id, {v}.answer_id, {v}.tech_id, {v}.round_id, {v}.emotion_id, {v}.feedback_id))")
+DEFAULT_TYPES = ["Candidate", "Question", "Skill", "Role", "Company", "Answer", "Technology", "InterviewRound", "Emotion", "Feedback"]
+_KEY = ("labels({v})[0] + ':' + toString(coalesce({v}.round_id, {v}.answer_id, {v}.question_id, "
+        "{v}.skill_id, {v}.role_id, {v}.company_id, {v}.tech_id, {v}.emotion_id, "
+        "{v}.feedback_id, {v}.candidate_id))")
 _NAME = "coalesce({v}.name, {v}.title, {v}.answer_id, {v}.round_id, {v}.text)"
 
 
