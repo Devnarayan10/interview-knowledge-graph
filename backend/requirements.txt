@@ -1,0 +1,26 @@
+# Web framework
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+python-multipart==0.0.9
+
+# Database drivers
+neo4j==5.25.0
+pymongo==4.8.0
+
+# Configuration
+pydantic==2.9.1
+pydantic-settings==2.5.2
+python-dotenv==1.0.1
+
+# AI / NLP (installed but lazy-loaded when AI_LAZY_LOAD=true)
+spacy==3.7.5
+transformers==4.44.2
+sentence-transformers==3.1.1
+torch==2.4.1
+openai-whisper==20240930
+
+# HTTP client for LLM providers
+httpx==0.27.2
+
+# Utilities
+numpy==1.26.4

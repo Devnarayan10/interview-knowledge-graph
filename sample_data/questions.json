@@ -1,0 +1,9 @@
+[
+  {
+    "question_id": "Q045",
+    "text": "Explain attention mechanism in transformers.",
+    "difficulty": "Hard",
+    "category": "NLP",
+    "skills": ["S010"]
+  }
+]

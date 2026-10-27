@@ -1,0 +1,102 @@
+services:
+  neo4j:
+    image: neo4j:5.15.0-enterprise
+    container_name: ikg-neo4j
+    environment:
+      - NEO4J_AUTH=${NEO4J_AUTH:-neo4j/interview_graph_password}
+      - NEO4J_ACCEPT_LICENSE_AGREEMENT=yes
+      - NEO4J_PLUGINS=["graph-data-science"]
+      - NEO4J_dbms_security_procedures_unrestricted=gds.*
+      - NEO4J_dbms_security_procedures_allowlist=gds.*
+    ports:
+      - "7474:7474"
+      - "7687:7687"
+    volumes:
+      - neo4j_data:/data
+      - neo4j_logs:/logs
+      - ./database/neo4j:/import/cypher
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:7474 || exit 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 40s
+    networks:
+      - ikg-network
+
+  mongodb:
+    image: mongo:7.0
+    container_name: ikg-mongodb
+    environment:
+      - MONGO_INITDB_DATABASE=${MONGO_INITDB_DATABASE:-interview_db}
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongodb_data:/data/db
+      - ./database/mongodb:/docker-entrypoint-initdb.d
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 20s
+    networks:
+      - ikg-network
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: ikg-backend
+    env_file:
+      - .env
+    environment:
+      - NEO4J_URI=bolt://neo4j:7687
+      - MONGODB_URI=mongodb://mongodb:27017
+      - CORS_ORIGINS=http://localhost:3000,http://localhost:5173,http://frontend:5173
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./backend:/app
+      - ./sample_data:/app/sample_data
+      - ./database:/app/database
+    depends_on:
+      neo4j:
+        condition: service_healthy
+      mongodb:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health')\""]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 60s
+    networks:
+      - ikg-network
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: ikg-frontend
+    environment:
+      - VITE_API_BASE_URL=http://localhost:8000/api
+    ports:
+      - "5173:5173"
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    depends_on:
+      backend:
+        condition: service_healthy
+    networks:
+      - ikg-network
+
+volumes:
+  neo4j_data:
+  neo4j_logs:
+  mongodb_data:
+
+networks:
+  ikg-network:
+    driver: bridge
