@@ -7,12 +7,11 @@ An interview analysis system that represents interview information as a **Knowle
 
 | Layer | Technology |
 |-------|------------|
-| Backend | Python, FastAPI, Uvicorn |
+| Backend | Python, FastAPI|
 | Graph DB | Neo4j, Cypher, Neo4j GDS |
 | Document DB | MongoDB |
-| AI/NLP | Whisper, spaCy, Hugging Face, Sentence Transformers |
 | Frontend | React, Tailwind CSS, Vite |
-| Deployment | Docker, Docker Compose |
+| Deployment | Docker|
 
 ---
 
@@ -34,58 +33,6 @@ MongoDB stores **flexible, semi-structured** interview artifacts:
 - Raw NLP output before graph normalization
 
 This separation follows the **polyglot persistence** pattern: structured relationships in Neo4j, unstructured blobs in MongoDB.
-
----
-
-## Project Structure
-
-```
-interview-knowledge-graph/
-├── backend/
-│   ├── app/
-│   │   ├── main.py              # FastAPI entry point
-│   │   ├── config.py            # Environment configuration
-│   │   ├── database/
-│   │   │   ├── neo4j.py         # Neo4j driver & sessions
-│   │   │   └── mongodb.py       # MongoDB client & collections
-│   │   ├── models/              # Domain models (Phase 5)
-│   │   ├── schemas/             # Pydantic schemas (Phase 5)
-│   │   ├── routes/              # API routes (Phase 5)
-│   │   ├── services/            # Business logic (Phase 5-6)
-│   │   ├── ai/                  # AI/NLP pipeline (Phase 7)
-│   │   ├── utils/
-│   │   └── seed/                # Seeding utilities (Phase 4)
-│   ├── requirements.txt
-│   ├── Dockerfile
-│   └── seed_database.py
-├── frontend/
-│   ├── src/
-│   │   ├── components/          # React components (Phase 8)
-│   │   ├── pages/               # Dashboard pages (Phase 8)
-│   │   ├── services/api.js      # API client
-│   │   ├── hooks/
-│   │   ├── App.jsx
-│   │   └── main.jsx
-│   ├── package.json
-│   ├── tailwind.config.js
-│   ├── vite.config.js
-│   └── Dockerfile
-├── database/
-│   ├── neo4j/
-│   │   ├── constraints.cypher   # Unique constraints & indexes
-│   │   ├── seed.cypher          # Seed reference patterns
-│   │   └── gds.cypher           # GDS projection reference
-│   └── mongodb/
-│       └── seed.js              # Collection initialization
-├── sample_data/
-│   ├── candidates.json
-│   ├── questions.json
-│   └── interviews.json
-├── docker-compose.yml
-├── .env.example
-├── .gitignore
-└── README.md
-```
 
 ---
 
