@@ -1,44 +1,7 @@
-# Interview Knowledge Graph for AI-Powered Candidate Evaluation
+# Interview Knowledge Graph for Candidate Evaluation
 
-An AI-powered interview analysis system that represents interview information as a **Knowledge Graph** (Neo4j) with raw/semi-structured interview data stored in **MongoDB**.
+An interview analysis system that represents interview information as a **Knowledge Graph** (Neo4j) with raw/semi-structured interview data stored in **MongoDB**.
 
-## Project Status
-
-| Phase | Description | Status |
-|-------|-------------|--------|
-| 1 | Folder structure & configuration | ✅ Complete |
-| 2 | Neo4j implementation | Pending |
-| 3 | MongoDB implementation | Pending |
-| 4 | Seed data | Pending |
-| 5 | FastAPI endpoints | Pending |
-| 6 | Analytics & GDS | Pending |
-| 7 | AI/NLP pipeline | Pending |
-| 8 | React frontend | Pending |
-| 9 | Frontend-backend integration | Pending |
-| 10 | Dockerization | Pending |
-| 11 | API testing | Pending |
-| 12 | End-to-end testing | Pending |
-
----
-
-## Architecture
-
-```
-┌─────────────┐     ┌─────────────┐     ┌─────────────┐
-│   React     │────▶│   FastAPI   │────▶│    Neo4j    │
-│  Dashboard  │     │   Backend   │     │ Graph + GDS │
-│  (Port 5173)│     │  (Port 8000)│     │ (7474/7687) │
-└─────────────┘     └──────┬──────┘     └─────────────┘
-                           │
-                           ▼
-                    ┌─────────────┐
-                    │   MongoDB   │
-                    │  (Port      │
-                    │   27017)    │
-                    └─────────────┘
-```
-
----
 
 ## Technologies
 
